@@ -25,7 +25,7 @@ LABELS = 159
 
 def onehot(x):
     x0 = x.view(-1, 1)
-    x1 = torch.zeros(len(x0), 2)
+    x1 = x.new_zeros(len(x0), 2)
     x1.scatter_(1, x0, 1)
     return x1.view(x.size(0), -1)
 
@@ -66,7 +66,7 @@ class FeatureEnergyNetwork(nn.Module):
             [torch.Tensor] -- (batch size, label size (i.e., LABELS) * 2),
         """
         batch_size = xs.size(0)
-        result = torch.zeros(batch_size * LABELS, 2)
+        result = xs.new_zeros(batch_size * LABELS, 2)
         result[:, 1].copy_(self.model(xs).view(-1))
         return result.view(batch_size, -1)
 
@@ -128,7 +128,7 @@ class SPENModel(nn.Module):
             self.global_network.learning_conf
         ])
 
-    def _random_probabilities(self, batch_size):
+    def _random_probabilities(self, batch_size, device=None):
         """returns a tensor with shape (batch size, self.num_nodes * self.num_vals),
         that sums to one at the last dimension when reshaped to (batch size, self.num_nodes, self.num_vals)
         
@@ -138,7 +138,7 @@ class SPENModel(nn.Module):
         Returns:
             Tensor -- torch Tensor
         """
-        x = torch.rand(self.num_nodes, self.num_vals + 1)
+        x = torch.rand(self.num_nodes, self.num_vals + 1, device=device)
         x[:, 0] = 0.
         x[:, -1] = 1.
         x, _ = x.sort(1)
@@ -149,7 +149,7 @@ class SPENModel(nn.Module):
     def _gradient_based_inference(self, potentials):
         batch_size = potentials.size(0)
         potentials = potentials.detach()
-        pred = self._random_probabilities(batch_size)
+        pred = self._random_probabilities(batch_size, potentials.device)
         prev = pred
         for iteration in range(1, self.inference_iterations):
             self.global_network.zero_grad()
@@ -209,7 +209,7 @@ def load_bibtex(path, device):
 
 
 class BibtexDataset(Dataset):
-    def __init__(self, xs, ys, flip_prob=None):
+    def __init__(self, xs, ys, flip_prob=None, device=None):
         self.xs = xs
         self.ys = ys
         self.onehot_ys = onehot(ys)
@@ -225,6 +225,7 @@ class BibtexDataset(Dataset):
         xs = self.xs[indices, :]
         if self.bernoulli:
             mask = self.bernoulli.sample((INPUTS,))
+            mask = mask.to(xs.device)
             xs = xs * (1 - mask) + (1 - xs) * mask
         return xs, self.ys[indices, :], self.onehot_ys[indices, :]
 
@@ -236,7 +237,7 @@ def test(model, dataset, cfg, threshold=None):
             preds = model.predict(xs)
         else:
             node_beliefs = model.predict_beliefs(xs).reshape(-1, 2)[:, 1]
-            preds = (node_beliefs > threshold).long()
+            preds = (node_beliefs > threshold).long().view(-1, LABELS)
         correct = (preds * ys).sum(1)
         total_correct += (preds == ys).float().sum()
         total_vars += ys.numel()
@@ -363,7 +364,7 @@ def main(cfg: DictConfig) -> None:
     logger.info(cfg.pretty())
 
     if cfg.device >= 0:
-        device = torch.device('gpu', cfg.device)
+        device = torch.device('cuda', cfg.device)
     else:
         device = torch.device('cpu')
 
@@ -372,18 +373,21 @@ def main(cfg: DictConfig) -> None:
     index = int(len(train_xs) * cfg.train_ratio)
     train_data = BibtexDataset(train_xs[:index, :],
                                train_ys[:index, :],
-                               flip_prob=cfg.flip_prob)
+                               flip_prob=cfg.flip_prob,
+                               device=device)
     val_data = BibtexDataset(train_xs[index:, :],
-                             train_ys[index:, :])
-                             
-    test_data = BibtexDataset(
-        *load_bibtex(hydra.utils.to_absolute_path(cfg.test), device))
+                             train_ys[index:, :],
+                             device=device)
+    test_xs, test_ys = load_bibtex(
+        hydra.utils.to_absolute_path(cfg.test), device)                    
+    test_data = BibtexDataset(test_xs, test_ys, device=device)
 
-    model = hydra.utils.instantiate(cfg.model, LABELS, 2, cfg).to(device)
+    model = hydra.utils.instantiate(cfg.model, LABELS, 2, cfg)
     if cfg.pretrained_unary:
         unary_model = UnaryModel(LABELS, 2, cfg)
         load_model(unary_model, cfg.pretrained_unary)
         model.feature_network = unary_model.feature_network
+    model = model.to(device)
 
     with TensorBoard(f'{cfg.model.name}_train') as train_logger, \
             TensorBoard(f'{cfg.model.name}_val') as val_logger:
