@@ -1,0 +1,24 @@
+num_epochs: 500
+use_sqrt_decay: true
+num_inf_itrs: 10000
+
+inf_lr: 1
+inf_eps: 1e-4
+inf_method: emd
+
+t_version: t_v1
+t_hidden_size: 16
+
+tune_thresholds: true
+pretrain_unary: ${UNARY_PRETRAIN}
+unary_dropout: 0.5
+unary_num_layers: 3
+use_entropy: true
+entropy_coef: 0.1
+
+flip_prob: null
+batch_size: 128
+
+unary_lr: 0
+t_unary_lr: 1e-2
+t_unary_mom: 0.9

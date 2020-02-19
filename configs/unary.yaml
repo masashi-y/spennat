@@ -1,0 +1,13 @@
+flip_prob: 0.01
+batch_size: 37
+num_epochs: 5000
+clip_grad_norm: 1
+tune_thresholds: true
+use_cross_ent: true
+
+num_layers: 3
+
+unary_dropout: 0.5
+unary_num_layers: 3 # unused
+unary_lr:  0.01
+unary_mom: 0.9
