@@ -1,9 +1,8 @@
 defaults:
   - configs: spen
 
-test: bibtex-test.arff
-train: bibtex-train.arff
-working_dir: working_dir
+test: data/bibtex/bibtex-test.arff
+train: data/bibtex/bibtex-train.arff
 train_ratio: 0.75
 val_interval: 5
-gpu: false
+device: -1

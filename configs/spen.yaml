@@ -1,24 +1,33 @@
+model:
+  class: spen.SpenModel
+  name: spen
 num_epochs: 500
-use_sqrt_decay: true
-num_inf_itrs: 10000
-
-inf_lr: 1
-inf_eps: 1e-4
-inf_method: emd
-
-t_version: t_v1
-t_hidden_size: 16
-
+batch_size: 128
+flip_prob: null
 tune_thresholds: true
-pretrain_unary: ${UNARY_PRETRAIN}
-unary_dropout: 0.5
-unary_num_layers: 3
-use_entropy: true
+use_cross_ent: false
+
+pretrained_unary: null
 entropy_coef: 0.1
 
-flip_prob: null
-batch_size: 128
+clip_grad_norm: 1
+clip_grad: null
 
-unary_lr: 0
-t_unary_lr: 1e-2
-t_unary_mom: 0.9
+inference:
+  use_sqrt_decay: true
+  iterations: 10000
+  learning_rate: 1
+  eps: null
+
+feature_network:
+  num_layers: 3
+  dropout: 0.5
+  learning_rate: 0.0  # not learn
+  momentum: 0.0
+  weight_decay: 0.0
+
+global_network:
+  hidden_size: 16
+  learning_rate: 0.01
+  momentum: 0.9
+  weight_decay: 0.0

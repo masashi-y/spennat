@@ -1,13 +1,20 @@
-flip_prob: 0.01
-batch_size: 37
+model:
+  class: spen.UnaryModel
+  name: unary
 num_epochs: 5000
-clip_grad_norm: 1
+batch_size: 37
+flip_prob: 0.01
 tune_thresholds: true
 use_cross_ent: true
 
-num_layers: 3
+pretrained_unary: null
 
-unary_dropout: 0.5
-unary_num_layers: 3 # unused
-unary_lr:  0.01
-unary_mom: 0.9
+clip_grad_norm: 1
+clip_grad: null
+
+feature_network:
+  num_layers: 3
+  dropout: 0.5
+  learning_rate: 0.01
+  momentum: 0.9
+  weight_decay: 0.0
