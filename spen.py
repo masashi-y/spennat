@@ -339,10 +339,11 @@ def train(model, train_data, val_data, cfg, train_logger, val_logger):
         if epoch % cfg.val_interval == 0:
             validation(epoch)
         avg_loss, count = 0, 0
-        model.train()
         for xs, ys, onehot_ys in train_data_loader:
             if not cfg.use_cross_ent:
                 ys = onehot_ys
+            model.train()
+            model.zero_grad()
             loss = model.loss(epoch, xs, ys)
             logger.info(
                 f'loss of batch {count}/{len(train_data_loader)}: {loss.item()}')
