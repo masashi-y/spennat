@@ -25,7 +25,7 @@ LABELS = 159
 
 def onehot(x):
     x0 = x.view(-1, 1)
-    x1 = x.new_zeros(len(x0), 2)
+    x1 = x.new_zeros(len(x0), 2, dtype=torch.float)
     x1.scatter_(1, x0, 1)
     return x1.view(x.size(0), -1)
 
@@ -96,7 +96,7 @@ class UnaryModel(nn.Module):
     def get_optimizer(self):
         return torch.optim.SGD(**self.feature_network.learning_conf)
 
-    def loss(self, epoch, xs, ys):
+    def loss(self, xs, ys):
         pred = self.feature_network(xs)
         return F.cross_entropy(pred.view(-1, self.num_vals), ys.view(-1))
 
@@ -119,7 +119,8 @@ class SPENModel(nn.Module):
         self.inference_iterations = cfg.inference.iterations
         self.inference_learning_rate = cfg.inference.learning_rate
         self.inference_eps = cfg.inference.eps
-        self.use_linear_decay = cfg.inference.use_sqrt_decay
+        self.inference_region_eps = cfg.inference.region_eps
+        self.use_sqrt_decay = cfg.inference.use_sqrt_decay
         self.entropy_coef = cfg.entropy_coef
 
     def get_optimizer(self):
@@ -151,30 +152,34 @@ class SPENModel(nn.Module):
         potentials = potentials.detach()
         pred = self._random_probabilities(batch_size, potentials.device)
         prev = pred
+        prev_energy = prev.new_full((batch_size,), -float('inf'))
         for iteration in range(1, self.inference_iterations):
             self.global_network.zero_grad()
             pred = pred.detach().requires_grad_()
             energy = self.global_network(pred, potentials) \
                    - self.entropy_coef * (pred * torch.log(pred + EPS)).sum(dim=1)
-            energy.sum().backward()
+            eps = torch.abs(energy - prev_energy).max().item()
+            if self.inference_eps is not None and eps < self.inference_eps:
+                break
+            prev_energy = energy.detach()
 
-            if self.use_linear_decay:
-                lr = self.inference_learning_rate / iteration
-            else:
+            energy.sum().backward()
+            if self.use_sqrt_decay:
                 lr = self.inference_learning_rate / np.sqrt(iteration)
+            else:
+                lr = self.inference_learning_rate / iteration
             lr_grad = lr * pred.grad.view(-1, self.num_vals)
             max_grad, _ = lr_grad.max(dim=1, keepdim=True)
             pred = pred.view(-1, self.num_vals) * torch.exp(lr_grad - max_grad)
             pred = (pred / (pred.sum(dim=1, keepdim=True) + EPS)).view(batch_size, -1)
             eps = (prev - pred).view(-1, self.num_vals).norm(dim=1).max().item()
-            if self.inference_eps is not None and eps < self.inference_eps:
+            if self.inference_region_eps is not None and eps < self.inference_region_eps:
                 break
             prev = pred
+        # logger.info(f'iteration: {iteration}')
         return pred
 
-    def loss(self, epoch, xs, ys):
-        self.global_network.train()
-        self.feature_network.train()
+    def loss(self, xs, ys):
         potentials = self.feature_network(xs)
         preds = self._gradient_based_inference(potentials)
         self.zero_grad()
@@ -344,9 +349,9 @@ def train(model, train_data, val_data, cfg, train_logger, val_logger):
                 ys = onehot_ys
             model.train()
             model.zero_grad()
-            loss = model.loss(epoch, xs, ys)
+            loss = model.loss(xs, ys)
             logger.info(
-                f'loss of batch {count}/{len(train_data_loader)}: {loss.item()}')
+                f'loss of batch {count + 1}/{len(train_data_loader)}: {loss.item()}')
             loss.backward()
             avg_loss += loss
             count += 1
@@ -380,13 +385,13 @@ def main(cfg: DictConfig) -> None:
                              train_ys[index:, :],
                              device=device)
     test_xs, test_ys = load_bibtex(
-        hydra.utils.to_absolute_path(cfg.test), device)                    
+        hydra.utils.to_absolute_path(cfg.test), device)
     test_data = BibtexDataset(test_xs, test_ys, device=device)
 
     model = hydra.utils.instantiate(cfg.model, LABELS, 2, cfg)
     if cfg.pretrained_unary:
         unary_model = UnaryModel(LABELS, 2, cfg)
-        load_model(unary_model, cfg.pretrained_unary)
+        load_model(unary_model, hydra.utils.to_absolute_path(cfg.pretrained_unary))
         model.feature_network = unary_model.feature_network
     model = model.to(device)
 
@@ -399,6 +404,8 @@ def main(cfg: DictConfig) -> None:
               train_logger,
               val_logger)
 
+    logger.info('loading best model...')
+    load_model(model, 'best_model')
     logger.info('finding best threshold on validation data...')
     (val_acc, val_prec ,val_rec ,val_f1), threshold = test_with_thresholds(model, val_data, cfg)
     logger.info('testing on training data...')

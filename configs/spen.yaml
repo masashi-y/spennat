@@ -1,8 +1,8 @@
 model:
-  class: spen.SpenModel
+  class: spen.SPENModel
   name: spen
 num_epochs: 500
-batch_size: 128
+batch_size: 20
 flip_prob: null
 tune_thresholds: true
 use_cross_ent: false
@@ -16,8 +16,9 @@ clip_grad: null
 inference:
   use_sqrt_decay: true
   iterations: 10000
-  learning_rate: 1
-  eps: null
+  learning_rate: 1.0
+  eps: 0.0001
+  region_eps: null
 
 feature_network:
   num_layers: 3
