@@ -307,7 +307,7 @@ def load_model(model, file_path):
             
 
 def test(model, dataset, cfg, threshold=None):
-    total_correct = total_vars = 0
+    total_f1 = total_precision = total_recall = total_correct = total_vars = 0
     for xs, ys, _ in DataLoader(dataset,
             batch_size=cfg.batch_size, collate_fn=collate_fun):
         if threshold is None:
@@ -315,26 +315,47 @@ def test(model, dataset, cfg, threshold=None):
         else:
             node_beliefs = model.predict_beliefs(xs, ys.size(0))[:, :, :, 1]
             preds = (node_beliefs > threshold).long()
+        correct = (preds * ys).sum((0,2))
         total_correct += (preds == ys).float().sum()
         total_vars += ys.numel()
+        prec = correct / (preds.sum((0,2)).float() + EPS)
+        rec = correct / (ys.sum((0,2)).float() + EPS)
+        total_precision += prec.sum()
+        total_recall += rec.sum()
+        total_f1 += ((2 * prec * rec) / (prec + rec + EPS)).sum()
     acc = (total_correct / total_vars).item()
-    return acc
+    f1 = (total_f1 / len(dataset)).item()
+    precision = (total_precision / len(dataset)).item()
+    recall = (total_recall / len(dataset)).item()
+    return acc, precision, recall, f1
 
 
 def test_with_thresholds(model, dataset, cfg):
     num_vars = 0
     thresholds = np.arange(0.05, 0.80, 0.05)
     total_accs = np.zeros_like(thresholds)
+    total_precs = np.zeros_like(thresholds)
+    total_recs = np.zeros_like(thresholds)
+    total_f1s = np.zeros_like(thresholds)
     for xs, ys, _ in DataLoader(dataset,
             batch_size=cfg.batch_size, collate_fn=collate_fun):
         num_vars += ys.numel()
         node_beliefs = model.predict_beliefs(xs, ys.size(0))[:, :, :, 1]
         for i, threshold in enumerate(thresholds):
             preds = (node_beliefs > threshold).long()
+            correct = (preds * ys).sum(1).float()
+            prec = correct / (preds.sum(1).float() + EPS)
+            rec = correct / (ys.sum(1).float() + EPS)
             total_accs[i] += (preds == ys).float().sum()
+            total_recs[i] += rec.sum()
+            total_precs[i] += prec.sum()
+            total_f1s[i] += ((2 * prec * rec) / (prec + rec + EPS)).sum()
     accs = total_accs / num_vars
-    best = accs.argmax()
-    return accs[best], thresholds[best]
+    precs = total_precs / len(dataset)
+    recs = total_recs / len(dataset)
+    f1s = total_f1s / len(dataset)
+    best = f1s.argmax()
+    return (accs[best], precs[best], recs[best], f1s[best]), thresholds[best]
 
 
 def train(model, dataset, val_data, cfg, train_logger, val_logger):
@@ -349,14 +370,16 @@ def train(model, dataset, val_data, cfg, train_logger, val_logger):
         else:
             test_fun = lambda *args: (test(*args), None)
 
-        acc, threshold = test_fun(model, dataset, cfg)
+        (acc, prec, rec, f1), threshold = test_fun(model, dataset, cfg)
         logger.info(
-            f'train results: {acc}, (threshold: {threshold})')
+            f'train results: {(acc, prec, rec, f1)}, (threshold: {threshold})')
+        train_logger.plot_for_current_epoch('F1', f1)
         train_logger.plot_for_current_epoch('Accuracy', acc)
         if val_data is not None:
-            acc, threshold = test_fun(model, val_data, cfg)
+            (acc, prec, rec, f1), threshold = test_fun(model, val_data, cfg)
             logger.info(
-                f'val results: {acc}, (threshold: {threshold})')
+                f'val results: {(acc, prec, rec, f1)}, (threshold: {threshold})')
+            val_logger.plot_for_current_epoch('F1', f1)
             val_logger.plot_for_current_epoch('Accuracy', acc)
 
         if acc > best_acc:
