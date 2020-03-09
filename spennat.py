@@ -3,6 +3,7 @@ import hydra
 import numpy as np
 import logging
 import time
+import random
 
 import spacy
 from spacy.tokens import Doc
@@ -356,32 +357,11 @@ def load_model(model, file_path):
             
 
 def test(model, dataset, cfg, threshold=None):
-    total_f1 = total_precision = total_recall = total_correct = total_vars = 0
-    for xs, ys, _ in DataLoader(dataset,
-            batch_size=cfg.batch_size, collate_fn=collate_fun):
-        if threshold is None:
-            preds = model.predict(xs, ys.size(0))
-        else:
-            node_beliefs = model.predict_beliefs(xs, ys.size(0))[:, :, :, 1]
-            preds = (node_beliefs > threshold).long()
-        correct = (preds * ys).sum((0,2))
-        total_correct += (preds == ys).float().sum()
-        total_vars += ys.numel()
-        prec = correct / (preds.sum((0,2)).float() + EPS)
-        rec = correct / (ys.sum((0,2)).float() + EPS)
-        total_precision += prec.sum()
-        total_recall += rec.sum()
-        total_f1 += ((2 * prec * rec) / (prec + rec + EPS)).sum()
-    acc = (total_correct / total_vars).item()
-    f1 = (total_f1 / len(dataset)).item()
-    precision = (total_precision / len(dataset)).item()
-    recall = (total_recall / len(dataset)).item()
-    return acc, precision, recall, f1
-
-
-def test_with_thresholds(model, dataset, cfg):
     num_vars = 0
-    thresholds = np.arange(0.05, 0.80, 0.05)
+    if threshold is None:
+        thresholds = np.arange(0.05, 0.80, 0.05)
+    else:
+        thresholds = np.array([threshold], dtype=np.float)
     total_accs = np.zeros_like(thresholds)
     total_precs = np.zeros_like(thresholds)
     total_recs = np.zeros_like(thresholds)
@@ -414,18 +394,13 @@ def train(model, vocab, dataset, val_data, cfg, train_logger, val_logger):
     def validation(epoch):
         global best_acc, best_epoch, best_threshold
         model.eval()
-        if cfg.tune_thresholds:
-            test_fun = test_with_thresholds
-        else:
-            test_fun = lambda *args: (test(*args), None)
-
-        (acc, prec, rec, f1), threshold = test_fun(model, dataset, cfg)
+        (acc, prec, rec, f1), threshold = test(model, dataset, cfg)
         logger.info(
             f'train results: {(acc, prec, rec, f1)}, (threshold: {threshold})')
         train_logger.plot_for_current_epoch('F1', f1)
         train_logger.plot_for_current_epoch('Accuracy', acc)
         if val_data is not None:
-            (acc, prec, rec, f1), threshold = test_fun(model, val_data, cfg)
+            (acc, prec, rec, f1), threshold = test(model, val_data, cfg)
             logger.info(
                 f'val results: {(acc, prec, rec, f1)}, (threshold: {threshold})')
             val_logger.plot_for_current_epoch('F1', f1)
@@ -456,8 +431,16 @@ def train(model, vocab, dataset, val_data, cfg, train_logger, val_logger):
         val_logger.update_epoch()
         if epoch % cfg.val_interval == 0:
             validation(epoch)
+            index = random.randint(0, len(dataset))
+            x, y, meta_data = dataset[index]
+            pred = model.predict_beliefs(x[None, :], y.size(0))[0, :, :, 1]
+            pred = ' '.join(vocab[bits] for bits in (pred > best_threshold).long())
+            logger.info(f'source: {meta_data["source"]}')
+            logger.info(f'gold: {meta_data["target"]}')
+            logger.info(f'pred: {pred}')
+
         avg_loss, count = 0, 0
-        for xs, ys, meta_data in train_data_loader:
+        for xs, ys, _ in train_data_loader:
             ys = onehot(ys)
             model.train()
             model.zero_grad()
