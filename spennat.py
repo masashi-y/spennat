@@ -346,10 +346,10 @@ def load_fra_eng_dataset(file_path,
             lines = f.read().split('\n')
         for line in lines[: min(num_samples, len(lines) - 1)]:
             x, y, _ = line.split('\t')
-            y = y.lower()
+            y = y.lower().replace('.', '').replace(',', '').replace('!', '')
             meta_data.append({ 'source': x, 'target': y })
             source_docs.append(spacy_model.tokenizer(x))
-            y = y.split(' ')
+            y = y.split()
             target_word_count.update([word for word in y])
             target_sents.append(y)
         with spacy_model.disable_pipes(['sentencizer']):
