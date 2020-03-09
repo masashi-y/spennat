@@ -1,11 +1,11 @@
 import os
 import numpy as np
 
-import tensorflow as tf
+from tensorboardX import SummaryWriter
 
 class TensorBoard:
     def __init__(self, logdir):
-        self.writer = tf.summary.create_file_writer(logdir)
+        self.writer = SummaryWriter(logdir)
         self.epoch = 0
         self.obj_count = 0
 
@@ -13,8 +13,7 @@ class TensorBoard:
         self.writer.close()
 
     def log_scalar(self, tag, value, global_step):
-        with self.writer.as_default():
-            tf.summary.scalar(tag, value, step=global_step)
+        self.writer.add_scalar(tag, value, global_step=global_step)
 
     def update_epoch(self):
         self.epoch += 1

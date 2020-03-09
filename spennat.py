@@ -241,6 +241,9 @@ class BitVocab(object):
             bits: word for word, bits in self.word2bits.items()
         }
 
+    def __len__(self):
+        return len(self.word2bits)
+
     def __getitem__(self, key):
         if isinstance(key, str):
             return self.word2bits.get(key, self.word2bits['UNK'])
@@ -488,9 +491,10 @@ def main(cfg: DictConfig) -> None:
             device=device,
             num_samples=cfg.num_samples,
             target_vocab_threshold=cfg.target_vocab_threshold)
+    logger.info(f'target language vocab size: {len(vocab)}')
 
     hidden_size = spacy_model.get_pipe('trf_tok2vec').token_vector_width
-    max_bit_size = dataset.bit_size
+    max_bit_size = vocab.bit_size
     model = SPENModel(hidden_size, max_bit_size, cfg).to(device)
 
     with TensorBoard('spennat_train') as train_logger, \
