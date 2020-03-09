@@ -16,6 +16,18 @@ entropy_coef: 0.1
 clip_grad_norm: null
 clip_grad: null
 
+# optimizer: adadelta(lr=1.0, rho=0.9, eps=1e-06, weight_decay=0)
+# optimizer: adagrad(lr=0.01, lr_decay=0, weight_decay=0, initial_accumulator_value=0, eps=1e-10)
+# optimizer: adam(lr=0.001, betas=(0.9, 0.999), eps=1e-08, weight_decay=0, amsgrad=False)
+optimizer: adamw(lr=0.001, betas=(0.9, 0.999), eps=1e-08, weight_decay=0.01, amsgrad=False)
+# optimizer: adamax(lr=0.002, betas=(0.9, 0.999), eps=1e-08, weight_decay=0)
+# optimizer: asgd(lr=0.01, lambd=0.0001, alpha=0.75, t0=1000000.0, weight_decay=0)
+# optimizer: lbfgs(lr=1, max_iter=20, max_eval=None, tolerance_grad=1e-07, tolerance_change=1e-09, history_size=100, line_search_fn=None)
+# optimizer: rmsprop(lr=0.01, alpha=0.99, eps=1e-08, weight_decay=0, momentum=0, centered=False)
+# optimizer: rmsprop(lr=0.01, alpha=0.99, eps=1e-08, weight_decay=0, momentum=0, centered=False)
+# optimizer: rprop(lr=0.01, etas=(0.5, 1.2), step_sizes=(1e-06, 50))
+# optimizer: sgd(lr=<required parameter>, momentum=0, dampening=0, weight_decay=0, nesterov=False)
+
 inference:
   use_sqrt_decay: true
   iterations: 10000
@@ -26,9 +38,6 @@ inference:
 feature_network:
   d_model: 512
   dropout: 0.5
-  learning_rate: 0.01
-  momentum: 0.9
-  weight_decay: 0.0
 
 global_network:
   d_model: 512
@@ -37,6 +46,3 @@ global_network:
   activation: relu
   dropout: 0.1
   num_layers: 1
-  learning_rate: 0.01
-  momentum: 0.9
-  weight_decay: 0.0

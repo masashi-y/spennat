@@ -23,7 +23,7 @@ class TensorBoard:
 
     def plot_obj_val(self, value):
         self.obj_count += 1
-        self.log_scalar('Training Objective Value', value, self.obj_count)
+        self.log_scalar('Training_Objective_Value', value, self.obj_count)
 
     def __enter__(self):
         return self

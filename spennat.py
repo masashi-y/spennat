@@ -1,3 +1,5 @@
+import sys
+import math
 import arff
 import hydra
 import numpy as np
@@ -39,13 +41,55 @@ def onehot(x):
     return x1.view(x.size() + (2,))
 
 
-def get_learing_conf(model, cfg):
-    return dict(
-        params=[p for p in model.parameters() if p.requires_grad],
-        lr=cfg.learning_rate,
-        weight_decay=cfg.weight_decay,
-        momentum=cfg.momentum
-    )
+optimizers = {
+    'adadelta': torch.optim.Adadelta,
+    'adagrad': torch.optim.Adagrad,
+    'lbfgs': torch.optim.LBFGS,
+    'adam': torch.optim.Adam,
+    'adamw': torch.optim.AdamW,
+    'adamax': torch.optim.Adamax,
+    'asgd': torch.optim.ASGD,
+    'sgd': torch.optim.SGD,
+    'rmsprop': torch.optim.RMSprop,
+    'rprop': torch.optim.Rprop,
+}
+
+
+def optimizer_of(string, params):
+    """Returns a optimizer object based on input string, e.g., adagrad(lr=0.01, lr_decay=0)
+    Arguments:
+        string {str} -- string expression of an optimizer
+        params {List[torch.Tensor]} -- parameters to learn
+    
+    Returns:
+        torch.optim.Optimizer -- optimizer
+    """
+    index = string.find('(')
+    assert string[-1] == ')'
+    try:
+        optim_class = optimizers[string[:index]]
+    except KeyError:
+        print(f'Optimizer class "{string[:index]}" does not exist.', file=sys.stderr)
+        print(f'Please choose one among: {list(optimizers.keys())}', file=sys.stderr)
+    kwargs = eval(f'dict{string[index:]}')
+    return optim_class(params, **kwargs)
+
+
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, dropout=0.1, max_len=5000):
+        super(PositionalEncoding, self).__init__()
+        self.dropout = nn.Dropout(p=dropout)
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0).transpose(0, 1)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        x = x + self.pe[:x.size(0), :]
+        return self.dropout(x)
 
 
 class FeatureNetwork(nn.Module):
@@ -53,7 +97,6 @@ class FeatureNetwork(nn.Module):
         super().__init__()
         self.linear = nn.Linear(hidden_size, cfg.d_model)
         self.dropout = nn.Dropout(cfg.dropout)
-        self.learning_conf = get_learing_conf(self, cfg)
 
     def forward(self, xs):
         """
@@ -73,6 +116,7 @@ class AttentionalEnergyNetwork(nn.Module):
         self.linear = nn.Linear(bit_size, cfg.d_model)
         self.dropout = nn.Dropout(cfg.dropout)
         self.linear_out = nn.Linear(cfg.d_model, 1)
+        self.pos_encoder = PositionalEncoding(cfg.d_model, cfg.dropout)
         self.model = nn.TransformerDecoder(
             nn.TransformerDecoderLayer(
                 d_model=cfg.d_model,
@@ -83,7 +127,6 @@ class AttentionalEnergyNetwork(nn.Module):
             ),
             cfg.num_layers
         )
-        self.learning_conf = get_learing_conf(self, cfg)
 
     def forward(self, ys, potentials):
         """
@@ -95,6 +138,7 @@ class AttentionalEnergyNetwork(nn.Module):
             torch.Tensor -- (batch size,)
         """
         ys = self.dropout(self.linear(ys[:, :, :, 1]))
+        ys = self.pos_encoder(ys)
         ys = self.model(ys, potentials)
         ys = self.linear_out(ys).squeeze().sum(0)
         return ys
@@ -113,12 +157,6 @@ class SPENModel(nn.Module):
         self.inference_region_eps = cfg.inference.region_eps
         self.use_sqrt_decay = cfg.inference.use_sqrt_decay
         self.entropy_coef = cfg.entropy_coef
-
-    def get_optimizer(self):
-        return torch.optim.SGD([
-            self.feature_network.learning_conf,
-            self.global_network.learning_conf
-        ])
 
     def _random_probabilities(self, batch_size, target_size, device=None):
         """returns a tensor with shape (target sent length, batch size, bit size, 2)
@@ -325,6 +363,10 @@ def load_fra_eng_dataset(file_path,
                 [vocab[word] for word in sent],
                 dtype=torch.long) for sent in target_sents
         ]
+        for meta in meta_data:
+            meta['target_unked'] = \
+                ' '.join(word if word in vocab.word2bits else 'UNK' \
+                     for word in meta['target'].split(' '))
         dataset = FraEngDataset(
             source_docs, target_bits, meta_data, device=device)
         return dataset, vocab
@@ -424,7 +466,10 @@ def train(model, vocab, dataset, val_data, cfg, train_logger, val_logger):
                                    shuffle=True,
                                    drop_last=True,
                                    collate_fn=collate_fun)
-    opt = model.get_optimizer()
+    optimizer = optimizer_of(
+        cfg.optimizer,
+        [param for param in model.parameters() if param.requires_grad]
+    )
     for epoch in range(cfg.num_epochs):
         logger.info(f'epoch {epoch + 1}')
         train_logger.update_epoch()
@@ -433,10 +478,11 @@ def train(model, vocab, dataset, val_data, cfg, train_logger, val_logger):
             validation(epoch)
             index = random.randint(0, len(dataset))
             x, y, meta_data = dataset[index]
-            pred = model.predict_beliefs(x[None, :], y.size(0))[0, :, :, 1]
+            pred = model.predict_beliefs(x[:, None, :], y.size(0))[:, 0, :, 1]
             pred = ' '.join(vocab[bits] for bits in (pred > best_threshold).long())
             logger.info(f'source: {meta_data["source"]}')
             logger.info(f'gold: {meta_data["target"]}')
+            logger.info(f'gold (unked): {meta_data["target_unked"]}')
             logger.info(f'pred: {pred}')
 
         avg_loss, count = 0, 0
@@ -455,7 +501,7 @@ def train(model, vocab, dataset, val_data, cfg, train_logger, val_logger):
             elif cfg.clip_grad_norm:
                 nn.utils.clip_grad_norm_(
                     model.parameters(), cfg.clip_grad_norm)
-            opt.step()
+            optimizer.step()
         train_logger.plot_obj_val((avg_loss / count).item())
     validation(cfg.num_epochs)
 
