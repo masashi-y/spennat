@@ -22,6 +22,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from experiment_utils import TensorBoard
+from transformer import TransformerDecoderLayer, TransformerDecoder, MyDropout
 
 logger = logging.getLogger(__file__)
 
@@ -78,7 +79,7 @@ def optimizer_of(string, params):
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model, dropout=0.1, max_len=5000):
         super(PositionalEncoding, self).__init__()
-        self.dropout = nn.Dropout(p=dropout)
+        self.dropout = MyDropout(dropout)
         pe = torch.zeros(max_len, d_model)
         position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
         div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
@@ -96,7 +97,7 @@ class FeatureNetwork(nn.Module):
     def __init__(self, hidden_size, cfg):
         super().__init__()
         self.linear = nn.Linear(hidden_size, cfg.d_model)
-        self.dropout = nn.Dropout(cfg.dropout)
+        self.dropout = MyDropout(cfg.dropout)
 
     def forward(self, xs):
         """
@@ -114,11 +115,11 @@ class AttentionalEnergyNetwork(nn.Module):
     def __init__(self, bit_size, cfg):
         super().__init__()
         self.linear = nn.Linear(bit_size, cfg.d_model)
-        self.dropout = nn.Dropout(cfg.dropout)
+        self.dropout = MyDropout(cfg.dropout)
         self.linear_out = nn.Linear(cfg.d_model, 1)
         self.pos_encoder = PositionalEncoding(cfg.d_model, cfg.dropout)
-        self.model = nn.TransformerDecoder(
-            nn.TransformerDecoderLayer(
+        self.model = TransformerDecoder(
+            TransformerDecoderLayer(
                 d_model=cfg.d_model,
                 nhead=cfg.nhead,
                 dim_feedforward=cfg.dim_feedforward,
@@ -211,6 +212,7 @@ class SPENModel(nn.Module):
             if self.inference_region_eps is not None and eps < self.inference_region_eps:
                 break
             prev = pred
+        logger.info(f'{iteration}')
         return pred
 
     def loss(self, xs, ys):
@@ -293,10 +295,12 @@ class BitVocab(object):
                 key = tuple(key)
             elif isinstance(key, (torch.Tensor, np.ndarray)):
                 assert len(key.shape) == 1 and key.shape[0] == self.bit_size
-                key = tuple(map(int, key))
+                key = tuple(int(k) for k in key)
             else:
                 raise KeyError(f'unacceptable key type: {type(key)}')
-            return self.bits2word.get(key, 'UNK')
+            res = self.bits2word.get(key, 'UNK')
+            logger.info(f'BitsVocab.__getitem__: {key} --> {res}')
+            return res
 
 
 class FraEngDataset(Dataset):
@@ -355,6 +359,7 @@ def load_fra_eng_dataset(file_path,
         with spacy_model.disable_pipes(['sentencizer']):
             for _, proc in spacy_model.pipeline:
                 source_docs = proc.pipe(source_docs, batch_size=32)
+        logger.info(f'max target sentence length: {max(map(len, target_sents))}')
         source_docs = list(source_docs)
         vocab = BitVocab(target_word_count,
                          count_threshold=target_vocab_threshold)
@@ -366,7 +371,7 @@ def load_fra_eng_dataset(file_path,
         for meta in meta_data:
             meta['target_unked'] = \
                 ' '.join(word if word in vocab.word2bits else 'UNK' \
-                     for word in meta['target'].split(' '))
+                     for word in meta['target'].split())
         dataset = FraEngDataset(
             source_docs, target_bits, meta_data, device=device)
         return dataset, vocab
@@ -470,20 +475,22 @@ def train(model, vocab, dataset, val_data, cfg, train_logger, val_logger):
         cfg.optimizer,
         [param for param in model.parameters() if param.requires_grad]
     )
-    for epoch in range(cfg.num_epochs):
-        logger.info(f'epoch {epoch + 1}')
+    for epoch in range(1, cfg.num_epochs + 1):
+        logger.info(f'epoch {epoch}')
         train_logger.update_epoch()
         val_logger.update_epoch()
         if epoch % cfg.val_interval == 0:
             validation(epoch)
-            index = random.randint(0, len(dataset))
-            x, y, meta_data = dataset[index]
-            pred = model.predict_beliefs(x[:, None, :], y.size(0))[:, 0, :, 1]
-            pred = ' '.join(vocab[bits] for bits in (pred > best_threshold).long())
-            logger.info(f'source: {meta_data["source"]}')
-            logger.info(f'gold: {meta_data["target"]}')
-            logger.info(f'gold (unked): {meta_data["target_unked"]}')
-            logger.info(f'pred: {pred}')
+            indices = [random.randint(0, len(dataset) - 1) for _ in range(5)]
+            xs, ys, meta_data = collate_fun([dataset[index] for index in indices])
+            preds = model.predict_beliefs(xs, ys.size(0))[:, :, :, 1]
+            preds = (preds > best_threshold).long()
+            for index, meta in enumerate(meta_data):
+                pred = ' '.join(vocab[bits] for bits in preds[:, index, :])
+                logger.info(f'source: {meta["source"]}')
+                logger.info(f'gold: {meta["target"]}')
+                logger.info(f'gold (unked): {meta["target_unked"]}')
+                logger.info(f'pred: {pred}')
 
         avg_loss, count = 0, 0
         for xs, ys, _ in train_data_loader:
