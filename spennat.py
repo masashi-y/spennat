@@ -221,43 +221,53 @@ class SPENModel(nn.Module):
 
 def bit_representation(num, max_size):
     bit_str = bin(num)[2:].rjust(max_size, '0')
-    return list(map(int, bit_str))
+    return tuple(map(int, bit_str))
+
+
+class BitVocab(object):
+    def __init__(self, counter, count_threshold=1):
+        counter['UNK'] = len(counter)
+        counter['MASK'] = len(counter)
+        common_vocab = [
+            word for word, count in counter.most_common() \
+            if count >= count_threshold
+        ]
+        self.bit_size = len(bin(len(common_vocab))) - 2
+        self.word2bits = {
+            word: bit_representation(rank, self.bit_size) \
+            for rank, word in enumerate(common_vocab, 1)
+        }
+        self.bits2word = {
+            bits: word for word, bits in self.word2bits.items()
+        }
+
+    def __getitem__(self, key):
+        if isinstance(key, str):
+            return self.word2bits.get(key, self.word2bits['UNK'])
+        else:
+            if isinstance(key, tuple):
+                pass
+            if isinstance(key, list):
+                key = tuple(key)
+            elif isinstance(key, (torch.Tensor, np.ndarray)):
+                assert len(key.shape) == 1 and key.shape[0] == self.bit_size
+                key = tuple(map(int, key))
+            else:
+                raise KeyError(f'unacceptable key type: {type(key)}')
+            return self.bits2word.get(key, 'UNK')
 
 
 class FraEngDataset(Dataset):
-    def __init__(self, path, spacy_model, device=None, num_samples=10000):
-        self.nlp = spacy_model
+    def __init__(self,
+                source_docs,
+                target_bits,
+                meta_data,
+                device=None):
+        assert len(source_docs) == len(target_bits) == len(meta_data)
+        self.source_docs = source_docs
+        self.target_bits = target_bits
+        self.meta_data = meta_data
         self.device = device
-        self.source_docs = []
-        self.target_sents = []
-        self.target_bits = []
-        self.meta_data = []
-        target_word_count = Counter()
-        with open(path, 'r', encoding='utf-8') as f:
-            lines = f.read().split('\n')
-        for line in lines[: min(num_samples, len(lines) - 1)]:
-            x, y, _ = line.split('\t')
-            y = y.lower()
-            self.meta_data.append({ 'source': x, 'target': y })
-            self.source_docs.append(self.nlp.tokenizer(x))
-            y = y.split(' ')
-            for word in y:
-                target_word_count[word] += 1
-            self.target_sents.append(y)
-        with self.nlp.disable_pipes(['sentencizer']):
-            for _, proc in self.nlp.pipeline:
-                self.source_docs = proc.pipe(self.source_docs, batch_size=32)
-        self.source_docs = list(self.source_docs)
-        self.bit_size = len(bin(len(target_word_count))) - 2
-        self.rank = {
-            word: bit_representation(rank, self.bit_size) \
-            for rank, (word, _) in enumerate(target_word_count.most_common(), 1)
-        }
-        for sent in self.target_sents:
-            sent_tensor = torch.tensor(
-                [self.rank[word] for word in sent],
-                dtype=torch.long)
-            self.target_bits.append(sent_tensor)
 
     def __len__(self):
         return len(self.source_docs)
@@ -277,9 +287,45 @@ class FraEngDataset(Dataset):
         ys = self.target_bits[index]
         xs = xs.to(self.device)
         ys = ys.to(self.device)
-        return xs, ys
+        meta = self.meta_data[index]
+        return xs, ys, meta
 
 
+def load_fra_eng_dataset(file_path,
+                         spacy_model,
+                         device=None,
+                         num_samples=10000,
+                         target_vocab_threshold=1):
+        source_docs = []
+        target_sents = []
+        meta_data = []
+        target_word_count = Counter()
+        with open(file_path, 'r', encoding='utf-8') as f:
+            lines = f.read().split('\n')
+        for line in lines[: min(num_samples, len(lines) - 1)]:
+            x, y, _ = line.split('\t')
+            y = y.lower()
+            meta_data.append({ 'source': x, 'target': y })
+            source_docs.append(spacy_model.tokenizer(x))
+            y = y.split(' ')
+            target_word_count.update([word for word in y])
+            target_sents.append(y)
+        with spacy_model.disable_pipes(['sentencizer']):
+            for _, proc in spacy_model.pipeline:
+                source_docs = proc.pipe(source_docs, batch_size=32)
+        source_docs = list(source_docs)
+        vocab = BitVocab(target_word_count,
+                         count_threshold=target_vocab_threshold)
+        target_bits = [
+            torch.tensor(
+                [vocab[word] for word in sent],
+                dtype=torch.long) for sent in target_sents
+        ]
+        dataset = FraEngDataset(
+            source_docs, target_bits, meta_data, device=device)
+        return dataset, vocab
+
+    
 def collate_fun(batch):
     """
     Arguments:
@@ -343,9 +389,9 @@ def test_with_thresholds(model, dataset, cfg):
         node_beliefs = model.predict_beliefs(xs, ys.size(0))[:, :, :, 1]
         for i, threshold in enumerate(thresholds):
             preds = (node_beliefs > threshold).long()
-            correct = (preds * ys).sum(1).float()
-            prec = correct / (preds.sum(1).float() + EPS)
-            rec = correct / (ys.sum(1).float() + EPS)
+            correct = (preds * ys).sum((0,2)).float()
+            prec = correct / (preds.sum((0,2)).float() + EPS)
+            rec = correct / (ys.sum((0,2)).float() + EPS)
             total_accs[i] += (preds == ys).float().sum()
             total_recs[i] += rec.sum()
             total_precs[i] += prec.sum()
@@ -358,7 +404,7 @@ def test_with_thresholds(model, dataset, cfg):
     return (accs[best], precs[best], recs[best], f1s[best]), thresholds[best]
 
 
-def train(model, dataset, val_data, cfg, train_logger, val_logger):
+def train(model, vocab, dataset, val_data, cfg, train_logger, val_logger):
     global best_acc, best_epoch, best_threshold
     best_acc, best_epoch, best_threshold = 0., -1, -1
 
@@ -436,11 +482,13 @@ def main(cfg: DictConfig) -> None:
     if cfg.device >= 0:
         spacy.prefer_gpu(cfg.device)
     spacy_model = spacy.load(cfg.spacy_model)
-    dataset = FraEngDataset(
+    dataset, vocab = load_fra_eng_dataset(
             hydra.utils.to_absolute_path(cfg.dataset),
             spacy_model,
             device=device,
-            num_samples=cfg.num_samples)
+            num_samples=cfg.num_samples,
+            target_vocab_threshold=cfg.target_vocab_threshold)
+
     hidden_size = spacy_model.get_pipe('trf_tok2vec').token_vector_width
     max_bit_size = dataset.bit_size
     model = SPENModel(hidden_size, max_bit_size, cfg).to(device)
@@ -448,6 +496,7 @@ def main(cfg: DictConfig) -> None:
     with TensorBoard('spennat_train') as train_logger, \
             TensorBoard('spennat_val') as val_logger:
         train(model,
+              vocab,
               dataset,
               None,
               cfg,

@@ -3,6 +3,7 @@ spacy_model: en_trf_bertbaseuncased_lg
 val_interval: 10
 device: -1
 num_samples: 10000
+target_vocab_threshold: 1
 
 num_epochs: 500
 batch_size: 20
