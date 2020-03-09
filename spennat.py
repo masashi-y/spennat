@@ -277,7 +277,8 @@ class FraEngDataset(Dataset):
         ys = self.target_bits[index]
         xs = xs.to(self.device)
         ys = ys.to(self.device)
-        return xs, ys
+        meta = self.meta_data[index]
+        return xs, ys, meta
 
 
 def collate_fun(batch):
