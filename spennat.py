@@ -367,7 +367,7 @@ class FraEngDataset(Dataset):
         return xs, ys, meta
 
 
-def load_fra_eng_dataset(file_path, spacy_model, cfg):
+def load_fra_eng_dataset(file_path, spacy_model, cfg, device=None):
         source_docs = []
         target_sents = []
         meta_data = []
@@ -398,7 +398,7 @@ def load_fra_eng_dataset(file_path, spacy_model, cfg):
                 ' '.join(word if word in vocab.word2bits else 'UNK' \
                      for word in meta['target'].split())
         dataset = FraEngDataset(
-            source_docs, target_bits, meta_data, device=cfg.device)
+            source_docs, target_bits, meta_data, device=device)
         return dataset, vocab
 
     
@@ -543,15 +543,15 @@ def main(cfg: DictConfig) -> None:
 
     if cfg.device >= 0:
         spacy.prefer_gpu(cfg.device)
-    cfg.device = get_device(cfg.device)
+    device = get_device(cfg.device)
     spacy_model = spacy.load(cfg.spacy_model)
     dataset, vocab = load_fra_eng_dataset(
-            hydra.utils.to_absolute_path(cfg.dataset), spacy_model, cfg)
+            hydra.utils.to_absolute_path(cfg.dataset), spacy_model, cfg, device=device)
     logger.info(f'target language vocab size: {len(vocab)}')
 
     hidden_size = spacy_model.get_pipe('trf_tok2vec').token_vector_width
     max_bit_size = vocab.bit_size
-    model = SPENModel(hidden_size, max_bit_size, cfg).to(cfg.device)
+    model = SPENModel(hidden_size, max_bit_size, cfg).to(device)
 
     with TensorBoard('spennat_train') as train_logger, \
             TensorBoard('spennat_val') as val_logger:

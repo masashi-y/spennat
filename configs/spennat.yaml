@@ -1,7 +1,7 @@
 dataset: data/fra-eng/fra.txt
 spacy_model: en_trf_bertbaseuncased_lg
 vocab:
-  class: BasicVocab
+  class: spennat.BasicVocab  # BitsVocab
   count_threshold: 1
 
 val_interval: 10
