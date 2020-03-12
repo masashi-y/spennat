@@ -35,12 +35,24 @@ def get_device(gpu_id):
         return torch.device('cpu')
 
 
-def onehot(x):
+def onehot(x, num_values):
     x0 = x.view(-1, 1)
-    x1 = x.new_zeros(len(x0), 2, dtype=torch.float)
+    x1 = x.new_zeros(len(x0), num_values, dtype=torch.float)
     x1.scatter_(1, x0, 1)
-    return x1.view(x.size() + (2,))
+    return x1.view(x.size() + (num_values,))
 
+
+def normalize_by_softmax(x):
+    """normalize prediction matrix by softmax with respect to bit size.
+    This is used when the prediction is expected to be one hot per target word
+    Arguments:
+        x {torch.Tensor} -- (target sent length, batch size, bit size, 2)
+    Returns:
+        torch.Tensor -- in the same shape as input
+    """
+    tmp = x[:, :, :, 1].softmax(2)[:, :, :, None]
+    res = torch.cat((tmp, 1 - tmp), 3)
+    return res
 
 optimizers = {
     'adadelta': torch.optim.Adadelta,
@@ -157,12 +169,13 @@ class AttentionalEnergyNetwork(nn.Module):
 
 
 class SPENModel(nn.Module):
-    def __init__(self, hidden_size, bit_size, cfg):
+    def __init__(self, cfg):
         super().__init__()
-        self.bit_size = bit_size
-        self.hidden_size = hidden_size
-        self.feature_network = FeatureNetwork(hidden_size, cfg.feature_network)
-        self.global_network = AttentionalEnergyNetwork(bit_size, cfg.global_network)
+        self.bit_size = cfg.bit_size
+        self.hidden_size = cfg.hidden_size
+        self.bit_is_onehot = cfg.bit_is_onehot
+        self.feature_network = FeatureNetwork(self.hidden_size, cfg.feature_network)
+        self.global_network = AttentionalEnergyNetwork(self.bit_size, cfg.global_network)
         self.inference_iterations = cfg.inference.iterations
         self.inference_learning_rate = cfg.inference.learning_rate
         self.inference_eps = cfg.inference.eps
@@ -238,6 +251,8 @@ class SPENModel(nn.Module):
         max_target_length = ys.size(0)
         potentials = self.feature_network(xs)
         preds = self._gradient_based_inference(potentials, max_target_length)
+        if self.bit_is_onehot:
+            preds = normalize_by_softmax(preds)
         self.zero_grad()
         pred_energy = self.global_network(preds, potentials)
         true_energy = self.global_network(ys, potentials)
@@ -256,6 +271,8 @@ class SPENModel(nn.Module):
         """
         potentials = self.feature_network(xs)
         preds = self._gradient_based_inference(potentials, max_target_length)
+        if self.bit_is_onehot:
+            preds = normalize_by_softmax(preds)
         return preds
 
     def predict(self, xs, max_target_length):
@@ -268,6 +285,8 @@ class SPENModel(nn.Module):
             torch.Tensor -- (max target sent length, batch size, bit size)
         """
         preds = self.predict_beliefs(xs, max_target_length)
+        if self.bit_is_onehot:
+            return onehot(preds[:, :, :, 1].argmax(2), self.bit_size)
         return preds.argmax(dim=3)
 
 
@@ -294,6 +313,7 @@ class VocabMixin(object):
 
 class BasicVocab(VocabMixin):
     def __init__(self, counter, count_threshold=1):
+        self.bit_is_onehot = True
         counter['UNK'] = len(counter)
         common_vocab = [
             word for word, count in counter.most_common() \
@@ -314,6 +334,7 @@ class BasicVocab(VocabMixin):
 
 class BitsVocab(VocabMixin):
     def __init__(self, counter, count_threshold=1):
+        self.bit_is_onehot = False
         counter['UNK'] = len(counter)
         common_vocab = [
             word for word, count in counter.most_common() \
@@ -507,8 +528,7 @@ def train(model, vocab, dataset, val_data, cfg, train_logger, val_logger):
             validation(epoch)
             indices = [random.randint(0, len(dataset) - 1) for _ in range(5)]
             xs, ys, meta_data = collate_fun([dataset[index] for index in indices])
-            preds = model.predict_beliefs(xs, ys.size(0))[:, :, :, 1]
-            preds = (preds > best_threshold).long()
+            preds = model.predict(xs, ys.size(0))
             for index, meta in enumerate(meta_data):
                 pred = ' '.join(vocab[bits] for bits in preds[:, index, :])
                 logger.info(f'source: {meta["source"]}')
@@ -518,7 +538,7 @@ def train(model, vocab, dataset, val_data, cfg, train_logger, val_logger):
 
         avg_loss, count = 0, 0
         for xs, ys, _ in train_data_loader:
-            ys = onehot(ys)
+            ys = onehot(ys, 2)
             model.train()
             model.zero_grad()
             loss = model.loss(xs, ys)
@@ -549,9 +569,10 @@ def main(cfg: DictConfig) -> None:
             hydra.utils.to_absolute_path(cfg.dataset), spacy_model, cfg, device=device)
     logger.info(f'target language vocab size: {len(vocab)}')
 
-    hidden_size = spacy_model.get_pipe('trf_tok2vec').token_vector_width
-    max_bit_size = vocab.bit_size
-    model = SPENModel(hidden_size, max_bit_size, cfg).to(device)
+    cfg.hidden_size = spacy_model.get_pipe('trf_tok2vec').token_vector_width
+    cfg.bit_size = vocab.bit_size
+    cfg.bit_is_onehot = vocab.bit_is_onehot
+    model = SPENModel(cfg).to(device)
 
     with TensorBoard('spennat_train') as train_logger, \
             TensorBoard('spennat_val') as val_logger:
