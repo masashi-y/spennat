@@ -271,28 +271,7 @@ class SPENModel(nn.Module):
         return preds.argmax(dim=3)
 
 
-def bit_representation(num, max_size):
-    bit_str = bin(num)[2:].rjust(max_size, '0')
-    return tuple(map(int, bit_str))
-
-
-class BitVocab(object):
-    def __init__(self, counter, count_threshold=1):
-        counter['UNK'] = len(counter)
-        # counter['MASK'] = len(counter)
-        common_vocab = [
-            word for word, count in counter.most_common() \
-            if count >= count_threshold
-        ]
-        self.bit_size = len(bin(len(common_vocab))) - 2
-        self.word2bits = {
-            word: bit_representation(rank, self.bit_size) \
-            for rank, word in enumerate(common_vocab, 1)
-        }
-        self.bits2word = {
-            bits: word for word, bits in self.word2bits.items()
-        }
-
+class VocabMixin(object):
     def __len__(self):
         return len(self.word2bits)
 
@@ -311,6 +290,47 @@ class BitVocab(object):
                 raise KeyError(f'unacceptable key type: {type(key)}')
             res = self.bits2word.get(key, 'UNK')
             return res
+
+
+class BasicVocab(VocabMixin):
+    def __init__(self, counter, count_threshold=1):
+        counter['UNK'] = len(counter)
+        common_vocab = [
+            word for word, count in counter.most_common() \
+            if count >= count_threshold
+        ]
+        self.bit_size = len(common_vocab)
+        self.word2bits = {
+            word: self.bit_representation(rank)
+            for rank, word in enumerate(common_vocab)
+        }
+        self.bits2word = {
+            bits: word for word, bits in self.word2bits.items()
+        }
+
+    def bit_representation(self, rank):
+        return tuple(int(i == rank) for i in range(self.bit_size))
+
+
+class BitsVocab(VocabMixin):
+    def __init__(self, counter, count_threshold=1):
+        counter['UNK'] = len(counter)
+        common_vocab = [
+            word for word, count in counter.most_common() \
+            if count >= count_threshold
+        ]
+        self.bit_size = len(bin(len(common_vocab))) - 2
+        self.word2bits = {
+            word: self.bit_representation(rank)
+            for rank, word in enumerate(common_vocab)
+        }
+        self.bits2word = {
+            bits: word for word, bits in self.word2bits.items()
+        }
+
+    def bit_representation(self, rank):
+        bit_str = bin(rank)[2:].rjust(self.bit_size, '0')
+        return tuple(map(int, bit_str))
 
 
 class FraEngDataset(Dataset):
@@ -347,18 +367,14 @@ class FraEngDataset(Dataset):
         return xs, ys, meta
 
 
-def load_fra_eng_dataset(file_path,
-                         spacy_model,
-                         device=None,
-                         num_samples=10000,
-                         target_vocab_threshold=1):
+def load_fra_eng_dataset(file_path, spacy_model, cfg):
         source_docs = []
         target_sents = []
         meta_data = []
         target_word_count = Counter()
         with open(file_path, 'r', encoding='utf-8') as f:
             lines = f.read().split('\n')
-        for line in lines[: min(num_samples, len(lines) - 1)]:
+        for line in lines[: min(cfg.num_samples, len(lines) - 1)]:
             x, y, _ = line.split('\t')
             y = y.lower()
             meta_data.append({ 'source': x, 'target': y })
@@ -371,8 +387,7 @@ def load_fra_eng_dataset(file_path,
                 source_docs = proc.pipe(source_docs, batch_size=32)
         logger.info(f'max target sentence length: {max(map(len, target_sents))}')
         source_docs = list(source_docs)
-        vocab = BitVocab(target_word_count,
-                         count_threshold=target_vocab_threshold)
+        vocab = hydra.utils.instantiate(cfg.vocab, target_word_count)
         target_bits = [
             torch.tensor(
                 [vocab[word] for word in sent],
@@ -383,7 +398,7 @@ def load_fra_eng_dataset(file_path,
                 ' '.join(word if word in vocab.word2bits else 'UNK' \
                      for word in meta['target'].split())
         dataset = FraEngDataset(
-            source_docs, target_bits, meta_data, device=device)
+            source_docs, target_bits, meta_data, device=cfg.device)
         return dataset, vocab
 
     
@@ -445,11 +460,10 @@ def test(model, dataset, cfg, threshold=None):
 
 
 def train(model, vocab, dataset, val_data, cfg, train_logger, val_logger):
-    global best_acc, best_epoch, best_threshold
     best_acc, best_epoch, best_threshold = 0., -1, -1
 
     def validation(epoch):
-        global best_acc, best_epoch, best_threshold
+        nonlocal best_acc, best_epoch, best_threshold
         model.eval()
         (acc, prec, rec, f1), threshold = test(model, dataset, cfg)
         logger.info(
@@ -527,21 +541,17 @@ def train(model, vocab, dataset, val_data, cfg, train_logger, val_logger):
 def main(cfg: DictConfig) -> None:
     logger.info(cfg.pretty())
 
-    device = get_device(cfg.device)
     if cfg.device >= 0:
         spacy.prefer_gpu(cfg.device)
+    cfg.device = get_device(cfg.device)
     spacy_model = spacy.load(cfg.spacy_model)
     dataset, vocab = load_fra_eng_dataset(
-            hydra.utils.to_absolute_path(cfg.dataset),
-            spacy_model,
-            device=device,
-            num_samples=cfg.num_samples,
-            target_vocab_threshold=cfg.target_vocab_threshold)
+            hydra.utils.to_absolute_path(cfg.dataset), spacy_model, cfg)
     logger.info(f'target language vocab size: {len(vocab)}')
 
     hidden_size = spacy_model.get_pipe('trf_tok2vec').token_vector_width
     max_bit_size = vocab.bit_size
-    model = SPENModel(hidden_size, max_bit_size, cfg).to(device)
+    model = SPENModel(hidden_size, max_bit_size, cfg).to(cfg.device)
 
     with TensorBoard('spennat_train') as train_logger, \
             TensorBoard('spennat_val') as val_logger:

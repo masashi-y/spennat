@@ -1,9 +1,12 @@
 dataset: data/fra-eng/fra.txt
 spacy_model: en_trf_bertbaseuncased_lg
+vocab:
+  class: BasicVocab
+  count_threshold: 1
+
 val_interval: 10
 device: -1
 num_samples: 10000
-target_vocab_threshold: 1
 
 num_epochs: 500
 batch_size: 20
@@ -35,13 +38,15 @@ inference:
   eps: 0.0001
   region_eps: null
 
+d_model: &d_model 512
+
 feature_network:
-  d_model: 512
+  d_model: *d_model
   dropout: 0.5
   num_layers: 2
 
 global_network:
-  d_model: 512
+  d_model: *d_model
   nhead: 8
   dim_feedforward: 2048
   activation: relu

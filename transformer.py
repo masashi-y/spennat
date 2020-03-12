@@ -7,7 +7,6 @@ import torch.nn.functional as F
 import math
 from typing import Dict, Optional, Tuple
 
-from fairseq import utils
 from torch import Tensor, nn
 from torch.nn import Parameter
 
