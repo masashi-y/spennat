@@ -1,8 +1,6 @@
 dataset: data/fra-eng/fra.txt
 spacy_model: en_trf_bertbaseuncased_lg
-vocab:
-  class: spennat.BasicVocab  # BitsVocab
-  count_threshold: 1
+vocab_count_threshold: 1
 
 val_interval: 10
 device: -1
@@ -11,8 +9,6 @@ num_samples: 10000
 num_epochs: 500
 batch_size: 20
 flip_prob: null
-tune_thresholds: true
-use_cross_ent: false
 
 entropy_coef: 0.1
 

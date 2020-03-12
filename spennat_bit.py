@@ -1,41 +1,44 @@
 import sys
 import math
+import arff
 import hydra
 import numpy as np
 import logging
+import time
 import random
 
 import spacy
+from spacy.tokens import Doc
 
+from pathlib import Path
 from omegaconf import DictConfig
 from collections import Counter
 
 import torch
 from torch.utils.data import DataLoader, Dataset
+from torch.autograd import variable
+from torch.distributions.bernoulli import Bernoulli
 import torch.nn as nn
+import torch.nn.functional as F
 
 from experiment_utils import TensorBoard
-from transformer import (TransformerDecoderLayer,
-                         TransformerDecoder,
-                         MyDropout,
-                         PositionalEncoding)
 
 logger = logging.getLogger(__file__)
 
 EPS = 1e-6
 
-
 def get_device(gpu_id):
     if gpu_id is not None and gpu_id >= 0:
         return torch.device('cuda', gpu_id)
-    return torch.device('cpu')
+    else:
+        return torch.device('cpu')
 
 
-def onehot(x, num_values):
+def onehot(x):
     x0 = x.view(-1, 1)
-    x1 = x.new_zeros(len(x0), num_values, dtype=torch.float)
+    x1 = x.new_zeros(len(x0), 2, dtype=torch.float)
     x1.scatter_(1, x0, 1)
-    return x1.view(x.size() + (num_values,))
+    return x1.view(x.size() + (2,))
 
 
 optimizers = {
@@ -57,7 +60,7 @@ def optimizer_of(string, params):
     Arguments:
         string {str} -- string expression of an optimizer
         params {List[torch.Tensor]} -- parameters to learn
-
+    
     Returns:
         torch.optim.Optimizer -- optimizer
     """
@@ -66,30 +69,34 @@ def optimizer_of(string, params):
     try:
         optim_class = optimizers[string[:index]]
     except KeyError:
-        raise KeyError(
-            f'Optimizer class "{string[:index]}" does not exist.\n'
-            f'Please choose one among: {list(optimizers.keys())}'
-        )
+        print(f'Optimizer class "{string[:index]}" does not exist.', file=sys.stderr)
+        print(f'Please choose one among: {list(optimizers.keys())}', file=sys.stderr)
     kwargs = eval(f'dict{string[index:]}')
     return optim_class(params, **kwargs)
+
+
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, dropout=0.1, max_len=5000):
+        super(PositionalEncoding, self).__init__()
+        self.dropout = nn.Dropout(p=dropout)
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0).transpose(0, 1)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        x = x + self.pe[:x.size(0), :]
+        return self.dropout(x)
 
 
 class FeatureNetwork(nn.Module):
     def __init__(self, hidden_size, cfg):
         super().__init__()
-        in_dim, out_dim = hidden_size, cfg.d_model
-        layers = []
-        for i in range(cfg.num_layers):
-            if cfg.dropout is not None:
-                layers.append(nn.Dropout(cfg.dropout))
-            linear = nn.Linear(in_dim, out_dim)
-            linear.weight.data.normal_(std=np.sqrt(2. / in_dim))
-            linear.bias.data.fill_(0.)
-            layers.append(linear)
-            if i + 1 < cfg.num_layers:
-                layers.append(nn.ReLU(inplace=True))
-            in_dim = out_dim
-        self.model = nn.Sequential(*layers)
+        self.linear = nn.Linear(hidden_size, cfg.d_model)
+        self.dropout = nn.Dropout(cfg.dropout)
 
     def forward(self, xs):
         """
@@ -99,19 +106,19 @@ class FeatureNetwork(nn.Module):
         Returns:
             torch.Tensor -- (source sent length, batch size, d_model)
         """
-        xs = self.model(xs)
+        xs = self.dropout(self.linear(xs))
         return xs
 
 
 class AttentionalEnergyNetwork(nn.Module):
-    def __init__(self, vocab_size, cfg):
+    def __init__(self, bit_size, cfg):
         super().__init__()
-        self.linear = nn.Linear(vocab_size, cfg.d_model)
-        self.dropout = MyDropout(cfg.dropout)
+        self.linear = nn.Linear(bit_size, cfg.d_model)
+        self.dropout = nn.Dropout(cfg.dropout)
         self.linear_out = nn.Linear(cfg.d_model, 1)
         self.pos_encoder = PositionalEncoding(cfg.d_model, cfg.dropout)
-        self.model = TransformerDecoder(
-            TransformerDecoderLayer(
+        self.model = nn.TransformerDecoder(
+            nn.TransformerDecoderLayer(
                 d_model=cfg.d_model,
                 nhead=cfg.nhead,
                 dim_feedforward=cfg.dim_feedforward,
@@ -124,26 +131,26 @@ class AttentionalEnergyNetwork(nn.Module):
     def forward(self, ys, potentials):
         """
         Arguments:
-            ys {torch.Tensor} -- (target sent length, batch size, vocab size)
+            ys {torch.Tensor} -- (target sent length, batch size, bit size, 2)
             potentials {torch.Tensor} -- (source sent length, batch size, hidden size)
-
+        
         Returns:
             torch.Tensor -- (batch size,)
         """
-        ys = self.dropout(self.linear(ys))
+        ys = self.dropout(self.linear(ys[:, :, :, 1]))
         ys = self.pos_encoder(ys)
         ys = self.model(ys, potentials)
-        ys = self.linear_out(ys).squeeze(2).sum(0)
+        ys = self.linear_out(ys).squeeze().sum(0)
         return ys
 
 
 class SPENModel(nn.Module):
-    def __init__(self, cfg, hidden_size, vocab_size):
+    def __init__(self, hidden_size, bit_size, cfg):
         super().__init__()
-        self.vocab_size = vocab_size
+        self.bit_size = bit_size
         self.hidden_size = hidden_size
-        self.feature_network = FeatureNetwork(self.hidden_size, cfg.feature_network)
-        self.global_network = AttentionalEnergyNetwork(self.vocab_size, cfg.global_network)
+        self.feature_network = FeatureNetwork(hidden_size, cfg.feature_network)
+        self.global_network = AttentionalEnergyNetwork(bit_size, cfg.global_network)
         self.inference_iterations = cfg.inference.iterations
         self.inference_learning_rate = cfg.inference.learning_rate
         self.inference_eps = cfg.inference.eps
@@ -152,31 +159,28 @@ class SPENModel(nn.Module):
         self.entropy_coef = cfg.entropy_coef
 
     def _random_probabilities(self, batch_size, target_size, device=None):
-        """returns a tensor with shape (target sent length, batch size, vocab size)
+        """returns a tensor with shape (target sent length, batch size, bit size, 2)
         that sums to one at the last dimension
-
+        
         Arguments:
             batch_size {int} -- batch size
             target_size {int} -- target sent length
             device {torch.device} -- torch device
-
+        
         Returns:
-            torch.Tensor -- (target sent length, batch size, vocab size)
+            torch.Tensor -- (target sent length, batch size, bit size, 2)
         """
-        x = torch.rand(target_size, self.vocab_size + 1, device=device)
-        x[:, 0] = 0.
-        x[:, -1] = 1.
-        x, _ = x.sort(1)
-        x = x[:, 1:] - x[:, :-1]
-        return x[:, None, :].expand(-1, batch_size, -1).contiguous()
+        x = torch.rand(target_size, self.bit_size, 2, device=device)
+        x[:, :, 0] = 1 - x[:, :, 1]
+        return x[:, None, :, :].expand(-1, batch_size, -1, -1).contiguous()
 
     def _gradient_based_inference(self, potentials, max_target_length):
         """
         Arguments:
             potentials {torch.Tensor} -- (source sent length, batch size, hidden size)
-
+        
         Returns:
-            torch.Tensor -- (target sent length, batch size, vocab size)
+            torch.Tensor -- (target sent length, batch size, bit size, 2)
         """
         batch_size = potentials.size(1)
         potentials = potentials.detach()
@@ -188,7 +192,7 @@ class SPENModel(nn.Module):
             self.global_network.zero_grad()
             pred = pred.detach().requires_grad_()
             energy = self.global_network(pred, potentials) \
-                   - self.entropy_coef * (pred * torch.log(pred + EPS)).sum(dim=(0, 2))
+                   - self.entropy_coef * (pred * torch.log(pred + EPS)).sum(dim=(0,2,3))
             eps = torch.abs(energy - prev_energy).max().item()
             if self.inference_eps is not None and eps < self.inference_eps:
                 break
@@ -207,15 +211,14 @@ class SPENModel(nn.Module):
             if self.inference_region_eps is not None and eps < self.inference_region_eps:
                 break
             prev = pred
-        logger.info('number of iterations: %d', iteration)
         return pred
 
     def loss(self, xs, ys):
         """
         Arguments:
             xs {torch.Tensor} -- (source sent length, batch size, hidden size)
-            ys {torch.Tensor} -- (target sent length, batch size, vocab size)
-
+            ys {torch.Tensor} -- (target sent length, batch size, bit size, 2)
+        
         Returns:
             torch.Tensor -- loss (batch size,)
         """
@@ -226,57 +229,82 @@ class SPENModel(nn.Module):
         pred_energy = self.global_network(preds, potentials)
         true_energy = self.global_network(ys, potentials)
         loss = pred_energy - true_energy \
-             - self.entropy_coef * (preds * torch.log(preds + EPS)).sum(dim=(0, 2))
+             - self.entropy_coef * (preds * torch.log(preds + EPS)).sum(dim=(0,2,3))
         return loss.mean()
+
+    def predict_beliefs(self, xs, max_target_length):
+        """
+        Arguments:
+            xs {torch.Tensor} -- (source sent length, batch size, hidden size)
+            max_target_length {int} -- max target sentence length
+        
+        Returns:
+            torch.Tensor -- (max target sent length, batch size, bit size, 2)
+        """
+        potentials = self.feature_network(xs)
+        preds = self._gradient_based_inference(potentials, max_target_length)
+        return preds
 
     def predict(self, xs, max_target_length):
         """
         Arguments:
             xs {torch.Tensor} -- (source sent length, batch size, hidden size)
             max_target_length {int} -- max target sentence length
-
+        
         Returns:
-            torch.Tensor -- (max target sent length, batch size)
+            torch.Tensor -- (max target sent length, batch size, bit size)
         """
-        potentials = self.feature_network(xs)
-        preds = self._gradient_based_inference(potentials, max_target_length)
-        return preds.argmax(dim=2)
+        preds = self.predict_beliefs(xs, max_target_length)
+        return preds.argmax(dim=3)
 
 
-class BasicVocab(object):
+def bit_representation(num, max_size):
+    bit_str = bin(num)[2:].rjust(max_size, '0')
+    return tuple(map(int, bit_str))
+
+
+class BitVocab(object):
     def __init__(self, counter, count_threshold=1):
         counter['UNK'] = len(counter)
-        frequent_words = [
+        counter['MASK'] = len(counter)
+        common_vocab = [
             word for word, count in counter.most_common() \
             if count >= count_threshold
         ]
-        self.vocab_size = len(frequent_words)
-        self.index2word = {
-            rank: word for rank, word in enumerate(frequent_words)
+        self.bit_size = len(bin(len(common_vocab))) - 2
+        self.word2bits = {
+            word: bit_representation(rank, self.bit_size) \
+            for rank, word in enumerate(common_vocab, 1)
         }
-        self.word2index = {
-            word: self.onehot_representation(rank) \
-            for rank, word in self.index2word.items()
+        self.bits2word = {
+            bits: word for word, bits in self.word2bits.items()
         }
-
-    def onehot_representation(self, rank):
-        return tuple(int(i == rank) for i in range(self.vocab_size))
 
     def __len__(self):
-        return len(self.word2index)
+        return len(self.word2bits)
 
     def __getitem__(self, key):
         if isinstance(key, str):
-            return self.word2index.get(key, self.word2index['UNK'])
-        return self.index2word.get(int(key), 'UNK')
+            return self.word2bits.get(key, self.word2bits['UNK'])
+        else:
+            if isinstance(key, tuple):
+                pass
+            if isinstance(key, list):
+                key = tuple(key)
+            elif isinstance(key, (torch.Tensor, np.ndarray)):
+                assert len(key.shape) == 1 and key.shape[0] == self.bit_size
+                key = tuple(map(int, key))
+            else:
+                raise KeyError(f'unacceptable key type: {type(key)}')
+            return self.bits2word.get(key, 'UNK')
 
 
 class FraEngDataset(Dataset):
     def __init__(self,
-                 source_docs,
-                 target_bits,
-                 meta_data,
-                 device=None):
+                source_docs,
+                target_bits,
+                meta_data,
+                device=None):
         assert len(source_docs) == len(target_bits) == len(meta_data)
         self.source_docs = source_docs
         self.target_bits = target_bits
@@ -290,14 +318,14 @@ class FraEngDataset(Dataset):
         """
         Arguments:
             index {int} -- element index
-
+        
         Returns:
             torch.Tensor -- (source sent length, hidden size)  e.g., output of BERT
-            torch.Tensor -- (target sent length, vocab size) one hot representation of target sentence
+            torch.Tensor -- (target sent length, bit size) bit representation of target sentence
             dict -- meta data concerning the example
         """
         xs = torch.from_numpy(
-            self.source_docs[index]._.trf_last_hidden_state)
+                self.source_docs[index]._.trf_last_hidden_state)
         ys = self.target_bits[index]
         xs = xs.to(self.device)
         ys = ys.to(self.device)
@@ -305,40 +333,43 @@ class FraEngDataset(Dataset):
         return xs, ys, meta
 
 
-def load_fra_eng_dataset(file_path, spacy_model, cfg, device=None):
-    source_docs = []
-    target_sents = []
-    meta_data = []
-    target_word_count = Counter()
-    with open(file_path, 'r', encoding='utf-8') as f:
-        lines = f.read().split('\n')
-    for line in lines[: min(cfg.num_samples, len(lines) - 1)]:
-        x, y, _ = line.split('\t')
-        y = y.lower()
-        meta_data.append({ 'source': x, 'target': y })
-        source_docs.append(spacy_model.tokenizer(x))
-        y = y.split()
-        target_word_count.update(word for word in y)
-        target_sents.append(y)
-    with spacy_model.disable_pipes(['sentencizer']):
-        for _, proc in spacy_model.pipeline:
-            source_docs = proc.pipe(source_docs, batch_size=32)
-    logger.info('max target sentence length: %d', max(map(len, target_sents)))
-    source_docs = list(source_docs)
-    vocab = BasicVocab(
-        target_word_count, count_threshold=cfg.vocab_count_threshold)
-    target_bits = [
-        torch.tensor(
-            [vocab[word] for word in sent],
-            dtype=torch.long) for sent in target_sents
-    ]
-    for meta in meta_data:
-        meta['target_unked'] = \
-            ' '.join(word if word in vocab.word2index else 'UNK' \
-                    for word in meta['target'].split())
-    dataset = FraEngDataset(
-        source_docs, target_bits, meta_data, device=device)
-    return dataset, vocab
+def load_fra_eng_dataset(file_path,
+                         spacy_model,
+                         device=None,
+                         num_samples=10000,
+                         target_vocab_threshold=1):
+        source_docs = []
+        target_sents = []
+        meta_data = []
+        target_word_count = Counter()
+        with open(file_path, 'r', encoding='utf-8') as f:
+            lines = f.read().split('\n')
+        for line in lines[: min(num_samples, len(lines) - 1)]:
+            x, y, _ = line.split('\t')
+            y = y.lower().replace('.', '').replace(',', '').replace('!', '')
+            meta_data.append({ 'source': x, 'target': y })
+            source_docs.append(spacy_model.tokenizer(x))
+            y = y.split()
+            target_word_count.update([word for word in y])
+            target_sents.append(y)
+        with spacy_model.disable_pipes(['sentencizer']):
+            for _, proc in spacy_model.pipeline:
+                source_docs = proc.pipe(source_docs, batch_size=32)
+        source_docs = list(source_docs)
+        vocab = BitVocab(target_word_count,
+                         count_threshold=target_vocab_threshold)
+        target_bits = [
+            torch.tensor(
+                [vocab[word] for word in sent],
+                dtype=torch.long) for sent in target_sents
+        ]
+        for meta in meta_data:
+            meta['target_unked'] = \
+                ' '.join(word if word in vocab.word2bits else 'UNK' \
+                     for word in meta['target'].split(' '))
+        dataset = FraEngDataset(
+            source_docs, target_bits, meta_data, device=device)
+        return dataset, vocab
 
     
 def collate_fun(batch):
@@ -348,7 +379,7 @@ def collate_fun(batch):
     
     Returns:
         torch.Tensor -- (source sent length, batch size, hidden size)
-        torch.Tensor -- (target sent length, batch size, vocab size)
+        torch.Tensor -- (target sent length, batch size, bit size)
         List[Dict[str, str]] -- list of meta data
     """
     xs, ys, meta_data = zip(*batch)
@@ -367,42 +398,68 @@ def load_model(model, file_path):
         model.load_state_dict(torch.load(f))
             
 
-def test(model, dataset, cfg):
-    total_correct = total_vars = 0
+def test(model, dataset, cfg, threshold=None):
+    num_vars = 0
+    if threshold is None:
+        thresholds = np.arange(0.05, 0.80, 0.05)
+    else:
+        thresholds = np.array([threshold], dtype=np.float)
+    total_accs = np.zeros_like(thresholds)
+    total_precs = np.zeros_like(thresholds)
+    total_recs = np.zeros_like(thresholds)
+    total_f1s = np.zeros_like(thresholds)
     for xs, ys, _ in DataLoader(dataset,
-                                batch_size=cfg.batch_size,
-                                collate_fn=collate_fun):
-        ys = ys.argmax(2)
-        preds = model.predict(xs, ys.size(0))
-        total_correct += (preds == ys).float().sum()
-        total_vars += ys.numel()
-    acc = (total_correct / total_vars).item()
-    return acc
+            batch_size=cfg.batch_size, collate_fn=collate_fun):
+        num_vars += ys.numel()
+        node_beliefs = model.predict_beliefs(xs, ys.size(0))[:, :, :, 1]
+        for i, threshold in enumerate(thresholds):
+            preds = (node_beliefs > threshold).long()
+            correct = (preds * ys).sum((0,2)).float()
+            prec = correct / (preds.sum((0,2)).float() + EPS)
+            rec = correct / (ys.sum((0,2)).float() + EPS)
+            total_accs[i] += (preds == ys).float().sum()
+            total_recs[i] += rec.sum()
+            total_precs[i] += prec.sum()
+            total_f1s[i] += ((2 * prec * rec) / (prec + rec + EPS)).sum()
+    accs = total_accs / num_vars
+    precs = total_precs / len(dataset)
+    recs = total_recs / len(dataset)
+    f1s = total_f1s / len(dataset)
+    best = f1s.argmax()
+    return (accs[best], precs[best], recs[best], f1s[best]), thresholds[best]
 
 
 def train(model, vocab, dataset, val_data, cfg, train_logger, val_logger):
-    best_acc, best_epoch = 0., -1
+    global best_acc, best_epoch, best_threshold
+    best_acc, best_epoch, best_threshold = 0., -1, -1
 
     def validation(epoch):
-        nonlocal best_acc, best_epoch
+        global best_acc, best_epoch, best_threshold
         model.eval()
-        acc = test(model, dataset, cfg)
-        logger.info('train accuracy: %f', acc)
+        (acc, prec, rec, f1), threshold = test(model, dataset, cfg)
+        logger.info(
+            f'train results: {(acc, prec, rec, f1)}, (threshold: {threshold})')
+        train_logger.plot_for_current_epoch('F1', f1)
         train_logger.plot_for_current_epoch('Accuracy', acc)
         if val_data is not None:
-            acc = test(model, val_data, cfg)
-            logger.info('val accuracy: %f', acc)
+            (acc, prec, rec, f1), threshold = test(model, val_data, cfg)
+            logger.info(
+                f'val results: {(acc, prec, rec, f1)}, (threshold: {threshold})')
+            val_logger.plot_for_current_epoch('F1', f1)
             val_logger.plot_for_current_epoch('Accuracy', acc)
 
         if acc > best_acc:
             best_acc = acc
             best_epoch = epoch
+            if cfg.tune_thresholds:
+                best_threshold = threshold
             logger.info('new best accuracy found, saving model')
             save_model(model, 'best_model')
 
         save_model(model, f'model_checkpoint_{epoch}')
         subset = 'val' if val_data is not None else 'train'
-        logger.info('best %s results (epoch %d): %f', subset, best_epoch, best_acc)
+        logger.info(
+            f'best {subset} results (epoch {best_epoch}, threshold {best_threshold}): {best_acc}')
 
     train_data_loader = DataLoader(dataset,
                                    batch_size=cfg.batch_size,
@@ -413,30 +470,29 @@ def train(model, vocab, dataset, val_data, cfg, train_logger, val_logger):
         cfg.optimizer,
         [param for param in model.parameters() if param.requires_grad]
     )
-    for epoch in range(1, cfg.num_epochs + 1):
-        logger.info('epoch %d', epoch)
+    for epoch in range(cfg.num_epochs):
+        logger.info(f'epoch {epoch + 1}')
         train_logger.update_epoch()
         val_logger.update_epoch()
         if epoch % cfg.val_interval == 0:
             validation(epoch)
-            indices = [random.randint(0, len(dataset) - 1) for _ in range(5)]
-            xs, ys, meta_data = collate_fun([dataset[index] for index in indices])
-            preds = model.predict(xs, ys.size(0))
-            for index, meta in enumerate(meta_data):
-                pred = ' '.join(vocab[word_index] for word_index in preds[:, index])
-                logger.info('source: %s', meta["source"])
-                logger.info('gold: %s', meta["target"])
-                logger.info('gold (unked): %s', meta["target_unked"])
-                logger.info('pred: %s', pred)
-                logger.info('-----------------------')
+            index = random.randint(0, len(dataset))
+            x, y, meta_data = dataset[index]
+            pred = model.predict_beliefs(x[:, None, :], y.size(0))[:, 0, :, 1]
+            pred = ' '.join(vocab[bits] for bits in (pred > best_threshold).long())
+            logger.info(f'source: {meta_data["source"]}')
+            logger.info(f'gold: {meta_data["target"]}')
+            logger.info(f'gold (unked): {meta_data["target_unked"]}')
+            logger.info(f'pred: {pred}')
 
         avg_loss, count = 0, 0
         for xs, ys, _ in train_data_loader:
+            ys = onehot(ys)
             model.train()
             model.zero_grad()
             loss = model.loss(xs, ys)
             logger.info(
-                'loss of batch %d/%d: %f', count + 1, len(train_data_loader), loss.item())
+                f'loss of batch {count + 1}/{len(train_data_loader)}: {loss.item()}')
             loss.backward()
             avg_loss += loss
             count += 1
@@ -454,17 +510,21 @@ def train(model, vocab, dataset, val_data, cfg, train_logger, val_logger):
 def main(cfg: DictConfig) -> None:
     logger.info(cfg.pretty())
 
+    device = get_device(cfg.device)
     if cfg.device >= 0:
         spacy.prefer_gpu(cfg.device)
-    device = get_device(cfg.device)
     spacy_model = spacy.load(cfg.spacy_model)
     dataset, vocab = load_fra_eng_dataset(
-            hydra.utils.to_absolute_path(cfg.dataset), spacy_model, cfg, device=device)
-    logger.info('target language vocab size: %d', len(vocab))
+            hydra.utils.to_absolute_path(cfg.dataset),
+            spacy_model,
+            device=device,
+            num_samples=cfg.num_samples,
+            target_vocab_threshold=cfg.target_vocab_threshold)
+    logger.info(f'target language vocab size: {len(vocab)}')
 
     hidden_size = spacy_model.get_pipe('trf_tok2vec').token_vector_width
-    vocab_size = vocab.vocab_size
-    model = SPENModel(cfg, hidden_size, vocab_size).to(device)
+    max_bit_size = vocab.bit_size
+    model = SPENModel(hidden_size, max_bit_size, cfg).to(device)
 
     with TensorBoard('spennat_train') as train_logger, \
             TensorBoard('spennat_val') as val_logger:
