@@ -38,6 +38,7 @@ inference:
 feature_network:
   d_model: 512
   dropout: 0.5
+  num_layers: 2
 
 global_network:
   d_model: 512

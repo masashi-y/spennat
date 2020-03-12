@@ -96,8 +96,19 @@ class PositionalEncoding(nn.Module):
 class FeatureNetwork(nn.Module):
     def __init__(self, hidden_size, cfg):
         super().__init__()
-        self.linear = nn.Linear(hidden_size, cfg.d_model)
-        self.dropout = MyDropout(cfg.dropout)
+        in_dim, out_dim = hidden_size, cfg.d_model
+        layers = []
+        for i in range(cfg.num_layers):
+            if cfg.dropout is not None:
+                layers.append(nn.Dropout(cfg.dropout))
+            linear = nn.Linear(in_dim, out_dim)
+            linear.weight.data.normal_(std=np.sqrt(2. / in_dim))
+            linear.bias.data.fill_(0.)
+            layers.append(linear)
+            if i + 1 < cfg.num_layers:
+                layers.append(nn.ReLU(inplace=True))
+            in_dim = out_dim
+        self.model = nn.Sequential(*layers)
 
     def forward(self, xs):
         """
@@ -107,7 +118,7 @@ class FeatureNetwork(nn.Module):
         Returns:
             torch.Tensor -- (source sent length, batch size, d_model)
         """
-        xs = self.dropout(self.linear(xs))
+        xs = self.model(xs)
         return xs
 
 
@@ -268,7 +279,7 @@ def bit_representation(num, max_size):
 class BitVocab(object):
     def __init__(self, counter, count_threshold=1):
         counter['UNK'] = len(counter)
-        counter['MASK'] = len(counter)
+        # counter['MASK'] = len(counter)
         common_vocab = [
             word for word, count in counter.most_common() \
             if count >= count_threshold
@@ -299,7 +310,6 @@ class BitVocab(object):
             else:
                 raise KeyError(f'unacceptable key type: {type(key)}')
             res = self.bits2word.get(key, 'UNK')
-            logger.info(f'BitsVocab.__getitem__: {key} --> {res}')
             return res
 
 
@@ -350,7 +360,7 @@ def load_fra_eng_dataset(file_path,
             lines = f.read().split('\n')
         for line in lines[: min(num_samples, len(lines) - 1)]:
             x, y, _ = line.split('\t')
-            y = y.lower().replace('.', '').replace(',', '').replace('!', '')
+            y = y.lower()
             meta_data.append({ 'source': x, 'target': y })
             source_docs.append(spacy_model.tokenizer(x))
             y = y.split()
