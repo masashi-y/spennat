@@ -38,6 +38,12 @@ def onehot(x, num_values):
     return x1.view(x.size() + (num_values,))
 
 
+def blunt_onehot_with_softmax(x, temperature=1):
+    x = torch.softmax(x / temperature, 2)
+    rnd = torch.randn_like(x) / 100.  # add some noise
+    return torch.clamp(x + rnd, 0., 1.)
+
+
 optimizers = {
     'adadelta': torch.optim.Adadelta,
     'adagrad': torch.optim.Adagrad,
@@ -170,7 +176,7 @@ class SPENModel(nn.Module):
         x = x[:, 1:] - x[:, :-1]
         return x[:, None, :].expand(-1, batch_size, -1).contiguous()
 
-    def _gradient_based_inference(self, potentials, max_target_length):
+    def _gradient_based_inference(self, potentials, max_target_length, init_pred=None):
         """
         Arguments:
             potentials {torch.Tensor} -- (source sent length, batch size, hidden size)
@@ -180,7 +186,7 @@ class SPENModel(nn.Module):
         """
         batch_size = potentials.size(1)
         potentials = potentials.detach()
-        pred = self._random_probabilities(
+        pred = init_pred or self._random_probabilities(
             batch_size, max_target_length, potentials.device)
         prev = pred
         prev_energy = prev.new_full((batch_size,), -float('inf'))
@@ -230,7 +236,7 @@ class SPENModel(nn.Module):
         loss = torch.max(loss, torch.zeros_like(loss))
         return loss.mean()
 
-    def predict(self, xs, max_target_length):
+    def predict(self, xs, max_target_length, init_pred=None):
         """
         Arguments:
             xs {torch.Tensor} -- (source sent length, batch size, hidden size)
@@ -240,7 +246,8 @@ class SPENModel(nn.Module):
             torch.Tensor -- (max target sent length, batch size)
         """
         potentials = self.feature_network(xs)
-        preds = self._gradient_based_inference(potentials, max_target_length)
+        preds = self._gradient_based_inference(
+            potentials, max_target_length, init_pred=init_pred)
         return preds.argmax(dim=2)
 
 
@@ -373,8 +380,12 @@ def test(model, dataset, cfg):
     for xs, ys, _ in DataLoader(dataset,
                                 batch_size=cfg.batch_size,
                                 collate_fn=collate_fun):
+        preds = model.predict(
+            xs,
+            ys.size(0),
+            init_pred=blunt_onehot_with_softmax(ys) if cfg.test_init_with_gold else None
+        )
         ys = ys.argmax(2)
-        preds = model.predict(xs, ys.size(0))
         total_correct += (preds == ys).float().sum()
         total_vars += ys.numel()
     acc = (total_correct / total_vars).item()
@@ -422,7 +433,11 @@ def train(model, vocab, dataset, val_data, cfg, train_logger, val_logger):
             validation(epoch)
             indices = [random.randint(0, len(dataset) - 1) for _ in range(5)]
             xs, ys, meta_data = collate_fun([dataset[index] for index in indices])
-            preds = model.predict(xs, ys.size(0))
+            preds = model.predict(
+                xs,
+                ys.size(0),
+                init_pred=blunt_onehot_with_softmax(ys) if cfg.test_init_with_gold else None
+            )
             for index, meta in enumerate(meta_data):
                 pred = ' '.join(vocab[word_index] for word_index in preds[:, index])
                 logger.info('source: %s', meta["source"])

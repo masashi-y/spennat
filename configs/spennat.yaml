@@ -1,11 +1,11 @@
 dataset: data/fra-eng/fra.txt
 spacy_model: en_trf_bertbaseuncased_lg
 vocab_count_threshold: 1
+test_init_with_gold: false
 
 val_interval: 10
 device: -1
 num_samples: 10000
-
 num_epochs: 500
 batch_size: 20
 flip_prob: null
