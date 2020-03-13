@@ -68,14 +68,18 @@ def optimizer_of(string, params):
         torch.optim.Optimizer -- optimizer
     """
     index = string.find('(')
-    assert string[-1] == ')'
+    if index >= 0:
+        assert string[-1] == ')', f'invalid format for the optimizer string: {string}'
+    else:
+        string += '()'
+        index = -2
     try:
         optim_class = optimizers[string[:index]]
-    except KeyError:
-        raise KeyError(
+    except KeyError as e:
+        raise Exception(
             f'Optimizer class "{string[:index]}" does not exist.\n'
             f'Please choose one among: {list(optimizers.keys())}'
-        )
+        ) from e
     kwargs = eval(f'dict{string[index:]}')
     return optim_class(params, **kwargs)
 
@@ -186,8 +190,11 @@ class SPENModel(nn.Module):
         """
         batch_size = potentials.size(1)
         potentials = potentials.detach()
-        pred = init_pred or self._random_probabilities(
-            batch_size, max_target_length, potentials.device)
+        if init_pred is not None:
+            pred = init_pred.detach()
+        else:
+            pred = self._random_probabilities(
+                batch_size, max_target_length, potentials.device)
         prev = pred
         prev_energy = prev.new_full((batch_size,), -float('inf'))
         for iteration in range(1, self.inference_iterations):
