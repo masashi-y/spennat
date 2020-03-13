@@ -227,6 +227,7 @@ class SPENModel(nn.Module):
         true_energy = self.global_network(ys, potentials)
         loss = pred_energy - true_energy \
              - self.entropy_coef * (preds * torch.log(preds + EPS)).sum(dim=(0, 2))
+        loss = torch.max(loss, torch.zeros_like(loss))
         return loss.mean()
 
     def predict(self, xs, max_target_length):
@@ -330,7 +331,7 @@ def load_fra_eng_dataset(file_path, spacy_model, cfg, device=None):
     target_bits = [
         torch.tensor(
             [vocab[word] for word in sent],
-            dtype=torch.long) for sent in target_sents
+            dtype=torch.float) for sent in target_sents
     ]
     for meta in meta_data:
         meta['target_unked'] = \
@@ -446,7 +447,9 @@ def train(model, vocab, dataset, val_data, cfg, train_logger, val_logger):
                 nn.utils.clip_grad_norm_(
                     model.parameters(), cfg.clip_grad_norm)
             optimizer.step()
-        train_logger.plot_obj_val((avg_loss / count).item())
+        loss = (avg_loss / count).item()
+        logger.info('loss of epoch %d: %f', epoch, loss)
+        train_logger.plot_obj_val(loss)
     validation(cfg.num_epochs)
 
 
