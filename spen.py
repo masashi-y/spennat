@@ -63,12 +63,12 @@ class FeatureEnergyNetwork(nn.Module):
             xs {torch.Tensor} -- (batch size, feature size (i.e., INPUTS))
         
         Returns:
-            [torch.Tensor] -- (batch size, label size (i.e., LABELS) * 2),
+            [torch.Tensor] -- (batch size, label size (i.e., LABELS), 2),
         """
         batch_size = xs.size(0)
-        result = xs.new_zeros(batch_size * LABELS, 2)
-        result[:, 1].copy_(self.model(xs).view(-1))
-        return result.view(batch_size, -1)
+        result = xs.new_zeros(batch_size, LABELS, 2)
+        result[:, :, 1].copy_(self.model(xs))
+        return result
 
 
 class GlobalEnergyNetwork(nn.Module):
@@ -81,8 +81,8 @@ class GlobalEnergyNetwork(nn.Module):
         self.learning_conf = get_learing_conf(self, cfg)
 
     def forward(self, ys, potentials):
-        global_energy = (ys * potentials).sum(dim=1)
-        label_energy = self.model(ys.view(-1, LABELS, 2)[:, :, 1]).squeeze()
+        global_energy = (ys * potentials).sum(dim=(1, 2))
+        label_energy = self.model(ys[:, :, 1]).squeeze(0)
         return global_energy + label_energy
         
 
@@ -102,11 +102,11 @@ class UnaryModel(nn.Module):
 
     def predict_beliefs(self, xs):
         pred = self.feature_network(xs)
-        return F.softmax(pred.view(-1, self.num_nodes, self.num_vals), dim=2)
+        return F.softmax(pred, dim=2)
 
     def predict(self, xs):
         pred = self.feature_network(xs)
-        return pred.view(-1, self.num_nodes, self.num_vals).argmax(dim=2)
+        return pred.argmax(dim=2)
 
 
 class SPENModel(nn.Module):
@@ -130,21 +130,21 @@ class SPENModel(nn.Module):
         ])
 
     def _random_probabilities(self, batch_size, device=None):
-        """returns a tensor with shape (batch size, self.num_nodes * self.num_vals),
-        that sums to one at the last dimension when reshaped to (batch size, self.num_nodes, self.num_vals)
+        """returns a tensor with shape (batch size, self.num_nodes, self.num_vals),
+        that sums to one at the last dimension
         
         Arguments:
             batch_size {int} -- batch size
         
         Returns:
-            Tensor -- torch Tensor
+            torch.Tensor -- (batch size, self.num_nodes, self.num_vals)
         """
         x = torch.rand(self.num_nodes, self.num_vals + 1, device=device)
         x[:, 0] = 0.
         x[:, -1] = 1.
         x, _ = x.sort(1)
-        return (x[:, 1:] - x[:, :-1]).view(-1) \
-                                     .expand(batch_size, -1) \
+        return (x[:, 1:] - x[:, :-1]).unsqueeze(0) \
+                                     .expand(batch_size, -1, -1) \
                                      .contiguous()
 
     def _gradient_based_inference(self, potentials):
@@ -157,8 +157,8 @@ class SPENModel(nn.Module):
             self.global_network.zero_grad()
             pred = pred.detach().requires_grad_()
             energy = self.global_network(pred, potentials) \
-                   - self.entropy_coef * (pred * torch.log(pred + EPS)).sum(dim=1)
-            eps = torch.abs(energy - prev_energy).max().item()
+                   - self.entropy_coef * (pred * torch.log(pred + EPS)).sum(dim=(1, 2))
+            eps = (energy - prev_energy).abs().max().item()
             if self.inference_eps is not None and eps < self.inference_eps:
                 break
             prev_energy = energy.detach()
@@ -168,15 +168,14 @@ class SPENModel(nn.Module):
                 lr = self.inference_learning_rate / np.sqrt(iteration)
             else:
                 lr = self.inference_learning_rate / iteration
-            lr_grad = lr * pred.grad.view(-1, self.num_vals)
-            max_grad, _ = lr_grad.max(dim=1, keepdim=True)
-            pred = pred.view(-1, self.num_vals) * torch.exp(lr_grad - max_grad)
-            pred = (pred / (pred.sum(dim=1, keepdim=True) + EPS)).view(batch_size, -1)
-            eps = (prev - pred).view(-1, self.num_vals).norm(dim=1).max().item()
+            lr_grad = lr * pred.grad
+            max_grad, _ = lr_grad.max(dim=-1, keepdim=True)
+            pred = pred * torch.exp(lr_grad - max_grad)
+            pred = pred / (pred.sum(dim=-1, keepdim=True) + EPS)
+            eps = (prev - pred).norm(dim=2).max().item()
             if self.inference_region_eps is not None and eps < self.inference_region_eps:
                 break
             prev = pred
-        # logger.info(f'iteration: {iteration}')
         return pred
 
     def loss(self, xs, ys):
@@ -186,7 +185,7 @@ class SPENModel(nn.Module):
         pred_energy = self.global_network(preds, potentials)
         true_energy = self.global_network(ys, potentials)
         loss = pred_energy - true_energy \
-             - self.entropy_coef * (preds * torch.log(preds + EPS)).sum(dim=1)
+             - self.entropy_coef * (preds * torch.log(preds + EPS)).sum(dim=(1, 2))
         return loss.mean()
 
     def predict_beliefs(self, xs):
@@ -197,8 +196,7 @@ class SPENModel(nn.Module):
     def predict(self, xs):
         potentials = self.feature_network(xs)
         preds = self._gradient_based_inference(potentials)
-        preds = preds.view(-1, self.num_nodes, self.num_vals).argmax(dim=2)
-        return preds
+        return preds.argmax(dim=2)
 
 
 def load_bibtex(path, device):
@@ -214,7 +212,7 @@ def load_bibtex(path, device):
 
 
 class BibtexDataset(Dataset):
-    def __init__(self, xs, ys, flip_prob=None, device=None):
+    def __init__(self, xs, ys, flip_prob=None):
         self.xs = xs
         self.ys = ys
         self.onehot_ys = onehot(ys)
@@ -226,13 +224,13 @@ class BibtexDataset(Dataset):
     def __len__(self):
         return self.xs.size(0)
 
-    def __getitem__(self, indices):
-        xs = self.xs[indices, :]
+    def __getitem__(self, index):
+        xs = self.xs[index, :]
         if self.bernoulli:
             mask = self.bernoulli.sample((INPUTS,))
             mask = mask.to(xs.device)
             xs = xs * (1 - mask) + (1 - xs) * mask
-        return xs, self.ys[indices, :], self.onehot_ys[indices, :]
+        return xs, self.ys[index, :], self.onehot_ys[index, :]
 
 
 def test(model, dataset, cfg, threshold=None):
@@ -241,8 +239,8 @@ def test(model, dataset, cfg, threshold=None):
         if threshold is None:
             preds = model.predict(xs)
         else:
-            node_beliefs = model.predict_beliefs(xs).reshape(-1, 2)[:, 1]
-            preds = (node_beliefs > threshold).long().view(-1, LABELS)
+            node_beliefs = model.predict_beliefs(xs)[:, :, 1]
+            preds = (node_beliefs > threshold).long()
         correct = (preds * ys).sum(1)
         total_correct += (preds == ys).float().sum()
         total_vars += ys.numel()
@@ -267,9 +265,9 @@ def test_with_thresholds(model, dataset, cfg):
     total_f1s = np.zeros_like(thresholds)
     for xs, ys, _ in DataLoader(dataset, batch_size=cfg.batch_size):
         num_vars += ys.numel()
-        node_beliefs = model.predict_beliefs(xs).reshape(-1, 2)[:, 1]
+        node_beliefs = model.predict_beliefs(xs)[:, :, 1]
         for i, threshold in enumerate(thresholds):
-            preds = (node_beliefs > threshold).long().view(-1, LABELS)
+            preds = (node_beliefs > threshold).long()
             correct = (preds * ys).sum(1).float()
             prec = correct / (preds.sum(1).float() + EPS)
             rec = correct / (ys.sum(1).float() + EPS)
@@ -296,11 +294,10 @@ def load_model(model, file_path):
             
 
 def train(model, train_data, val_data, cfg, train_logger, val_logger):
-    global best_f1, best_epoch, best_threshold
     best_f1, best_epoch, best_threshold = 0., -1, -1
 
     def validation(epoch):
-        global best_f1, best_epoch, best_threshold
+        nonlocal best_f1, best_epoch, best_threshold
         model.eval()
         if cfg.tune_thresholds:
             test_fun = test_with_thresholds
