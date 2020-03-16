@@ -27,7 +27,7 @@ def onehot(x):
     x0 = x.view(-1, 1)
     x1 = x.new_zeros(len(x0), 2, dtype=torch.float)
     x1.scatter_(1, x0, 1)
-    return x1.view(x.size(0), -1)
+    return x1.view(x.size() + (2,))
 
 
 def get_learing_conf(model, cfg):
@@ -147,6 +147,16 @@ class SPENModel(nn.Module):
                                      .expand(batch_size, -1, -1) \
                                      .contiguous()
 
+    def _lr(self, iteration):
+        if self.use_sqrt_decay:
+            if self.use_sqrt_decay:
+                lr = self.inference_learning_rate / np.sqrt(iteration)
+            else:
+                lr = self.inference_learning_rate / iteration
+            return self.inference_learning_rate / np.sqrt(iteration)
+        else:
+            return self.inference_learning_rate / iteration
+
     def _gradient_based_inference(self, potentials):
         batch_size = potentials.size(0)
         potentials = potentials.detach()
@@ -158,23 +168,21 @@ class SPENModel(nn.Module):
             pred = pred.detach().requires_grad_()
             energy = self.global_network(pred, potentials) \
                    - self.entropy_coef * (pred * torch.log(pred + EPS)).sum(dim=(1, 2))
-            eps = (energy - prev_energy).abs().max().item()
-            if self.inference_eps is not None and eps < self.inference_eps:
-                break
-            prev_energy = energy.detach()
+            if (
+                self.inference_eps is not None
+                and torch.all((energy - prev_energy).abs() < self.inference_eps)
+            ): break
+            prev_energy = energy
 
             energy.sum().backward()
-            if self.use_sqrt_decay:
-                lr = self.inference_learning_rate / np.sqrt(iteration)
-            else:
-                lr = self.inference_learning_rate / iteration
-            lr_grad = lr * pred.grad
+            lr_grad = self._lr(iteration) * pred.grad
             max_grad, _ = lr_grad.max(dim=-1, keepdim=True)
             pred = pred * torch.exp(lr_grad - max_grad)
             pred = pred / (pred.sum(dim=-1, keepdim=True) + EPS)
-            eps = (prev - pred).norm(dim=2).max().item()
-            if self.inference_region_eps is not None and eps < self.inference_region_eps:
-                break
+            if (
+                self.inference_region_eps is not None
+                and torch.all((prev - pred).norm(dim=2) < self.inference_region_eps)
+            ): break
             prev = pred
         return pred
 
@@ -334,8 +342,8 @@ def train(model, train_data, val_data, cfg, train_logger, val_logger):
                                    shuffle=True,
                                    drop_last=True)
     opt = model.get_optimizer()
-    for epoch in range(cfg.num_epochs):
-        logger.info(f'epoch {epoch + 1}')
+    for epoch in range(1, cfg.num_epochs + 1):
+        logger.info(f'epoch {epoch}')
         train_logger.update_epoch()
         val_logger.update_epoch()
         if epoch % cfg.val_interval == 0:
@@ -366,6 +374,11 @@ def train(model, train_data, val_data, cfg, train_logger, val_logger):
 def main(cfg: DictConfig) -> None:
     logger.info(cfg.pretty())
 
+    torch.manual_seed(0)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    np.random.seed(0)
+
     if cfg.device >= 0:
         device = torch.device('cuda', cfg.device)
     else:
@@ -376,14 +389,12 @@ def main(cfg: DictConfig) -> None:
     index = int(len(train_xs) * cfg.train_ratio)
     train_data = BibtexDataset(train_xs[:index, :],
                                train_ys[:index, :],
-                               flip_prob=cfg.flip_prob,
-                               device=device)
+                               flip_prob=cfg.flip_prob)
     val_data = BibtexDataset(train_xs[index:, :],
-                             train_ys[index:, :],
-                             device=device)
+                             train_ys[index:, :])
     test_xs, test_ys = load_bibtex(
         hydra.utils.to_absolute_path(cfg.test), device)
-    test_data = BibtexDataset(test_xs, test_ys, device=device)
+    test_data = BibtexDataset(test_xs, test_ys)
 
     model = hydra.utils.instantiate(cfg.model, LABELS, 2, cfg)
     if cfg.pretrained_unary:
