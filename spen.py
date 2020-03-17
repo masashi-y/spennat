@@ -1,61 +1,42 @@
-import arff
 import hydra
 import numpy as np
 import logging
-import time
 
-from pathlib import Path
 from omegaconf import DictConfig
 
 import torch
-from torch.utils.data import DataLoader, Dataset
-from torch.autograd import variable
-from torch.distributions.bernoulli import Bernoulli
+from torch.utils.data import DataLoader
 import torch.nn as nn
 import torch.nn.functional as F
 
-from experiment_utils import TensorBoard
+from spen.tensorboard import TensorBoard
+import spen.utils as utils
+from spen.dataset.bibtex import load_bibtex, BibtexDataset, INPUTS, LABELS
+
 
 logger = logging.getLogger(__file__)
 
 EPS = 1e-6
-INPUTS = 1836
-LABELS = 159
 
-
-def onehot(x):
-    x0 = x.view(-1, 1)
-    x1 = x.new_zeros(len(x0), 2, dtype=torch.float)
-    x1.scatter_(1, x0, 1)
-    return x1.view(x.size(0), -1)
-
-
-def get_learing_conf(model, cfg):
-    return dict(
-        params=[p for p in model.parameters() if p.requires_grad],
-        lr=cfg.learning_rate,
-        weight_decay=cfg.weight_decay,
-        momentum=cfg.momentum
-    )
 
 class FeatureEnergyNetwork(nn.Module):
-    def __init__(self, cfg):
+    def __init__(self, in_dim, out_dim, cfg):
         super().__init__()
-        in_dim, out_dim = INPUTS, 150
+        self.in_dim = in_dim
+        self.out_dim = out_dim
         layers = []
         for _ in range(cfg.num_layers - 1):
             if cfg.dropout is not None:
                 layers.append(nn.Dropout(cfg.dropout))
-            linear = nn.Linear(in_dim, out_dim)
+            linear = nn.Linear(in_dim, cfg.hidden_size)
             linear.weight.data.normal_(std=np.sqrt(2. / in_dim))
             linear.bias.data.fill_(0.)
             layers.extend([linear, nn.ReLU(inplace=True)])
-            in_dim = out_dim
-        layers.append(nn.Linear(in_dim, LABELS))
+            in_dim = cfg.hidden_size
+        layers.append(nn.Linear(in_dim, self.out_dim))
         layers[-1].weight.data.normal_(std=np.sqrt(2. / in_dim))
         layers[-1].bias.data.fill_(0.)
         self.model = nn.Sequential(*layers)
-        self.learning_conf = get_learing_conf(self, cfg)
 
     def forward(self, xs):
         """
@@ -66,19 +47,18 @@ class FeatureEnergyNetwork(nn.Module):
             [torch.Tensor] -- (batch size, label size (i.e., LABELS), 2),
         """
         batch_size = xs.size(0)
-        result = xs.new_zeros(batch_size, LABELS, 2)
+        result = xs.new_zeros(batch_size, self.out_dim, 2)
         result[:, :, 1].copy_(self.model(xs))
         return result
 
 
 class GlobalEnergyNetwork(nn.Module):
-    def __init__(self, cfg):
+    def __init__(self, num_labels, cfg):
         super().__init__()
         self.model = nn.Sequential(
-            nn.Linear(LABELS, cfg.hidden_size, bias=False),
+            nn.Linear(num_labels, cfg.hidden_size, bias=False),
             nn.Softplus(),
             nn.Linear(cfg.hidden_size, 1, bias=False))
-        self.learning_conf = get_learing_conf(self, cfg)
 
     def forward(self, ys, potentials):
         global_energy = (ys * potentials).sum(dim=(1, 2))
@@ -87,14 +67,11 @@ class GlobalEnergyNetwork(nn.Module):
         
 
 class UnaryModel(nn.Module):
-    def __init__(self, num_nodes, num_vals, cfg):
+    def __init__(self, feature_network, num_nodes, num_vals, cfg):
         super().__init__()
-        self.feature_network = FeatureEnergyNetwork(cfg.feature_network)
+        self.feature_network = feature_network
         self.num_nodes = num_nodes
         self.num_vals = num_vals
-
-    def get_optimizer(self):
-        return torch.optim.SGD(**self.feature_network.learning_conf)
 
     def loss(self, xs, ys):
         pred = self.feature_network(xs)
@@ -110,10 +87,10 @@ class UnaryModel(nn.Module):
 
 
 class SPENModel(nn.Module):
-    def __init__(self, num_nodes, num_vals, cfg):
+    def __init__(self, feature_network, global_network, num_nodes, num_vals, cfg):
         super().__init__()
-        self.feature_network = FeatureEnergyNetwork(cfg.feature_network)
-        self.global_network = GlobalEnergyNetwork(cfg.global_network)
+        self.feature_network = feature_network
+        self.global_network = global_network
         self.num_nodes = num_nodes
         self.num_vals = num_vals
         self.inference_iterations = cfg.inference.iterations
@@ -122,12 +99,6 @@ class SPENModel(nn.Module):
         self.inference_region_eps = cfg.inference.region_eps
         self.use_sqrt_decay = cfg.inference.use_sqrt_decay
         self.entropy_coef = cfg.entropy_coef
-
-    def get_optimizer(self):
-        return torch.optim.SGD([
-            self.feature_network.learning_conf,
-            self.global_network.learning_conf
-        ])
 
     def _random_probabilities(self, batch_size, device=None):
         """returns a tensor with shape (batch size, self.num_nodes, self.num_vals),
@@ -199,40 +170,6 @@ class SPENModel(nn.Module):
         return preds.argmax(dim=2)
 
 
-def load_bibtex(path, device):
-    xs, ys = [], []
-    with open(path) as f:
-        for sample in arff.load(f)['data']:
-            sample = list(map(int, sample))
-            xs.append(sample[:-LABELS])
-            ys.append(sample[-LABELS:])
-    xs = torch.tensor(xs, dtype=torch.float, device=device)
-    ys = torch.tensor(ys, dtype=torch.long, device=device)
-    return xs, ys
-
-
-class BibtexDataset(Dataset):
-    def __init__(self, xs, ys, flip_prob=None):
-        self.xs = xs
-        self.ys = ys
-        self.onehot_ys = onehot(ys)
-        if flip_prob is not None:
-            self.bernoulli = Bernoulli(probs=flip_prob)
-        else:
-            self.bernoulli = None
-
-    def __len__(self):
-        return self.xs.size(0)
-
-    def __getitem__(self, index):
-        xs = self.xs[index, :]
-        if self.bernoulli:
-            mask = self.bernoulli.sample((INPUTS,))
-            mask = mask.to(xs.device)
-            xs = xs * (1 - mask) + (1 - xs) * mask
-        return xs, self.ys[index, :], self.onehot_ys[index, :]
-
-
 def test(model, dataset, cfg, threshold=None):
     total_f1 = total_precision = total_recall = total_correct = total_vars = 0
     for xs, ys, _ in DataLoader(dataset, batch_size=cfg.batch_size):
@@ -283,16 +220,6 @@ def test_with_thresholds(model, dataset, cfg):
     return (accs[best], precs[best], recs[best], f1s[best]), thresholds[best]
 
 
-def save_model(model, file_path):
-    with open(file_path, 'wb') as f:
-        torch.save(model.state_dict(), f)
-
-
-def load_model(model, file_path):
-    with open(file_path, 'rb') as f:
-        model.load_state_dict(torch.load(f))
-            
-
 def train(model, train_data, val_data, cfg, train_logger, val_logger):
     best_f1, best_epoch, best_threshold = 0., -1, -1
 
@@ -322,18 +249,23 @@ def train(model, train_data, val_data, cfg, train_logger, val_logger):
             if cfg.tune_thresholds:
                 best_threshold = threshold
             logger.info('new best f1 found, saving model')
-            save_model(model, 'best_model')
+            utils.save_model(model, 'best_model')
 
-        save_model(model, f'model_checkpoint_{epoch}')
+        utils.save_model(model, f'model_checkpoint_{epoch}')
         subset = 'val' if val_data is not None else 'train'
         logger.info(
             f'best {subset} results (epoch {best_epoch}, threshold {best_threshold}): {best_f1}')
 
-    train_data_loader = DataLoader(train_data,
-                                   batch_size=cfg.batch_size,
-                                   shuffle=True,
-                                   drop_last=True)
-    opt = model.get_optimizer()
+    train_data_loader = DataLoader(
+        train_data,
+        batch_size=cfg.batch_size,
+        shuffle=True,
+        drop_last=True
+    )
+    optimizer = utils.optimizer_of(
+        cfg.optimizer,
+        [param for param in model.parameters() if param.requires_grad]
+    )
     for epoch in range(cfg.num_epochs):
         logger.info(f'epoch {epoch + 1}')
         train_logger.update_epoch()
@@ -357,7 +289,7 @@ def train(model, train_data, val_data, cfg, train_logger, val_logger):
             elif cfg.clip_grad_norm:
                 nn.utils.clip_grad_norm_(
                     model.parameters(), cfg.clip_grad_norm)
-            opt.step()
+            optimizer.step()
         train_logger.plot_obj_val((avg_loss / count).item())
     validation(cfg.num_epochs)
 
@@ -365,35 +297,37 @@ def train(model, train_data, val_data, cfg, train_logger, val_logger):
 @hydra.main(config_path='config.yaml')
 def main(cfg: DictConfig) -> None:
     logger.info(cfg.pretty())
+    device = utils.get_device(cfg.device)
+    train_data, val_data, test_data =  load_bibtex(
+        hydra.utils.to_absolute_path(cfg.train),
+        hydra.utils.to_absolute_path(cfg.test),
+        train_ratio=cg.train_ratio,
+        device=device)
 
-    if cfg.device >= 0:
-        device = torch.device('cuda', cfg.device)
+    if cfg.model == 'spen'
+        model = SPENModel(
+            FeatureEnergyNetwork(INPUTS, LABELS, cfg.feature_network),
+            GlobalEnergyNetwork(LABELS, cfg.global_network),
+            cfg.model, LABELS, 2, cfg)
+    elif cfg.model == 'unary':
+        model = UnaryModel(
+            FeatureEnergyNetwork(INPUTS, LABELS, cfg.feature_network),
+            LABELS, 2, cfg)
     else:
-        device = torch.device('cpu')
+        assert False
 
-    train_xs, train_ys = load_bibtex(
-        hydra.utils.to_absolute_path(cfg.train), device)
-    index = int(len(train_xs) * cfg.train_ratio)
-    train_data = BibtexDataset(train_xs[:index, :],
-                               train_ys[:index, :],
-                               flip_prob=cfg.flip_prob,
-                               device=device)
-    val_data = BibtexDataset(train_xs[index:, :],
-                             train_ys[index:, :],
-                             device=device)
-    test_xs, test_ys = load_bibtex(
-        hydra.utils.to_absolute_path(cfg.test), device)
-    test_data = BibtexDataset(test_xs, test_ys, device=device)
-
-    model = hydra.utils.instantiate(cfg.model, LABELS, 2, cfg)
     if cfg.pretrained_unary:
-        unary_model = UnaryModel(LABELS, 2, cfg)
-        load_model(unary_model, hydra.utils.to_absolute_path(cfg.pretrained_unary))
+        unary_model = UnaryModel(
+            FeatureEnergyNetwork(INPUTS, LABELS, cfg.feature_network),
+            LABELS, 2, cfg)
+        utils.load_model(unary_model, hydra.utils.to_absolute_path(cfg.pretrained_unary))
         model.feature_network = unary_model.feature_network
+        if cfg.feature_network.freeze:
+            model.feature_network.requires_grad_(False)
     model = model.to(device)
 
-    with TensorBoard(f'{cfg.model.name}_train') as train_logger, \
-            TensorBoard(f'{cfg.model.name}_val') as val_logger:
+    with TensorBoard(f'{cfg.model}_train') as train_logger, \
+            TensorBoard(f'{cfg.model}_val') as val_logger:
         train(model,
               train_data,
               val_data,
@@ -402,7 +336,7 @@ def main(cfg: DictConfig) -> None:
               val_logger)
 
     logger.info('loading best model...')
-    load_model(model, 'best_model')
+    utils.load_model(model, 'best_model')
     logger.info('finding best threshold on validation data...')
     (val_acc, val_prec ,val_rec ,val_f1), threshold = test_with_thresholds(model, val_data, cfg)
     logger.info('testing on training data...')
