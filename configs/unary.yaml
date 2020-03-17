@@ -1,11 +1,10 @@
-model:
-  class: spen.UnaryModel
-  name: unary
+model: unary
 num_epochs: 5000
 batch_size: 37
 flip_prob: 0.01
 tune_thresholds: true
 use_cross_ent: true
+optimizer: sgd(lr=0.01, momentum=0.9, weight_decay=0.0)
 
 pretrained_unary: null
 
@@ -13,8 +12,7 @@ clip_grad_norm: 1
 clip_grad: null
 
 feature_network:
+  freeze: false
+  hidden_size: 150
   num_layers: 3
   dropout: 0.5
-  learning_rate: 0.01
-  momentum: 0.9
-  weight_decay: 0.0

@@ -1,14 +1,11 @@
-model:
-  class: spen.SPENModel
-  name: spen
+model: spen
 num_epochs: 500
 batch_size: 20
-flip_prob: null
 tune_thresholds: true
 use_cross_ent: false
+optimizer: sgd(lr=0.01, momentum=0.9, weight_decay=0.0)
 
 pretrained_unary: null
-entropy_coef: 0.1
 
 clip_grad_norm: null
 clip_grad: null
@@ -21,14 +18,12 @@ inference:
   region_eps: null
 
 feature_network:
+  hidden_size: 150
   num_layers: 3
   dropout: 0.5
-  learning_rate: 0.0  # not learn
-  momentum: 0.0
-  weight_decay: 0.0
+  freeze: true
 
 global_network:
   hidden_size: 16
-  learning_rate: 0.01
-  momentum: 0.9
-  weight_decay: 0.0
+
+entropy_coef: 0.1
