@@ -11,7 +11,7 @@ import torch.nn as nn
 from spennat.tensorboard import TensorBoard
 import spennat.utils as utils
 from spennat.datasets.bibtex import load_bibtex, INPUTS, LABELS
-from spennat.models import UnaryModel, SPENModel
+from spennat.models import UnaryModel, SPENModel, UnrolledSPENModel
 
 
 logger = logging.getLogger(__file__)
@@ -207,6 +207,13 @@ def main(cfg: DictConfig) -> None:
 
     if cfg.model == 'spen':
         model = SPENModel(
+            FeatureEnergyNetwork(INPUTS, LABELS, cfg.feature_network),
+            GlobalEnergyNetwork(LABELS, cfg.global_network),
+            cfg,
+            num_nodes=LABELS,
+            num_vals=2)
+    elif cfg.model == 'unrolled_spen':
+        model = UnrolledSPENModel(
             FeatureEnergyNetwork(INPUTS, LABELS, cfg.feature_network),
             GlobalEnergyNetwork(LABELS, cfg.global_network),
             cfg,

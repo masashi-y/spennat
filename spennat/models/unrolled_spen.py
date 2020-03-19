@@ -3,7 +3,7 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 
-from spen.utils import random_probabilities
+from spennat.utils import random_probabilities
 
 
 EPS = 1e-6
