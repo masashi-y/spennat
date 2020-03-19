@@ -11,7 +11,7 @@ def onehot(x, n):
     x0 = x.view(-1, 1)
     x1 = x.new_zeros(len(x0), n, dtype=torch.float)
     x1.scatter_(1, x0, 1)
-    return x1.view(x.size(0), -1)
+    return x1.view(x.size() + (n,))
 
 
 def save_model(model, file_path):

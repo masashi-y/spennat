@@ -1,7 +1,7 @@
 import arff
 import torch
 from torch.utils.data import Dataset
-from spen.utils import onehot
+from spennat.utils import onehot
 
 INPUTS = 1836
 LABELS = 159
