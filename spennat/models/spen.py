@@ -1,12 +1,26 @@
 
 import torch
+import numpy as np
+from spen.utils import random_probabilities
 
 
 EPS = 1e-6
 
 
-class SPENModel(nn.Module):
-    def __init__(self, feature_network, global_network, num_nodes, num_vals, cfg):
+class SPENModel(torch.nn.Module):
+    """Structured Prediction Energy Network described in 
+        - David Belanger and Andrew McCallum "Structured Prediction Energy Networks." ICML 2016. 
+          https://arxiv.org/abs/1511.06350.
+    """
+    def __init__(self, feature_network, global_network, cfg, *, num_nodes, num_vals):
+        """
+        Arguments:
+            feature_network {torch.nn.Module} -- feature network mapping (batch size, input dim) -> (batch size, num_nodes, num_vals)
+            global_network {torch.nn.Module} -- energy network mapping (batch size, output dim) -> (batch size,)
+            cfg {dict} --  config dictionary
+            num_nodes {int} -- 
+            num_vals {int} -- 
+        """
         super().__init__()
         self.feature_network = feature_network
         self.global_network = global_network
@@ -19,34 +33,16 @@ class SPENModel(nn.Module):
         self.use_sqrt_decay = cfg.inference.use_sqrt_decay
         self.entropy_coef = cfg.entropy_coef
 
-    def _random_probabilities(self, batch_size, device=None):
-        """returns a tensor with shape (batch size, self.num_nodes, self.num_vals),
-        that sums to one at the last dimension
-        
-        Arguments:
-            batch_size {int} -- batch size
-        
-        Returns:
-            torch.Tensor -- (batch size, self.num_nodes, self.num_vals)
-        """
-        x = torch.rand(self.num_nodes, self.num_vals + 1, device=device)
-        x[:, 0] = 0.
-        x[:, -1] = 1.
-        x, _ = x.sort(1)
-        return (x[:, 1:] - x[:, :-1]).unsqueeze(0) \
-                                     .expand(batch_size, -1, -1) \
-                                     .contiguous()
-
     def _lr(self, iteration):
         if self.use_sqrt_decay:
             return self.inference_learning_rate / np.sqrt(iteration)
-        else:
-            return self.inference_learning_rate / iteration
+        return self.inference_learning_rate / iteration
 
     def _gradient_based_inference(self, potentials):
         batch_size = potentials.size(0)
         potentials = potentials.detach()
-        pred = self._random_probabilities(batch_size, potentials.device)
+        pred = random_probabilities(
+            batch_size, self.num_nodes, self.num_vals, potentials.device)
         prev = pred
         prev_energy = prev.new_full((batch_size,), -float('inf'))
         for iteration in range(1, self.inference_iterations):
@@ -91,5 +87,3 @@ class SPENModel(nn.Module):
         potentials = self.feature_network(xs)
         preds = self._gradient_based_inference(potentials)
         return preds.argmax(dim=2)
-
-
