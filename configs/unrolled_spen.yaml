@@ -1,8 +1,8 @@
-model: spen
+model: unrolled_spen
 num_epochs: 500
 batch_size: 20
 tune_thresholds: true
-use_cross_ent: false
+use_cross_ent: true
 optimizer: sgd(lr=0.01, momentum=0.9, weight_decay=0.0)
 
 pretrained_unary: null

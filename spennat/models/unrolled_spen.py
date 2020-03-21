@@ -37,9 +37,10 @@ class EntropicMirrorAscentOptimizer(object):
             loss,
             ys,
             create_graph=self._track_higher_grads,
-            allow_unused=True  # boo
+            allow_unused=True
         )
-        lr_grad = self._lr * grad
+        # ys = ys + next(self.lr) * grad
+        lr_grad = next(self.lr) * grad
         max_grad, _ = lr_grad.max(dim=-1, keepdim=True)
         ys = ys * torch.exp(lr_grad - max_grad)
         ys = ys / (ys.sum(dim=-1, keepdim=True) + EPS)
@@ -93,6 +94,7 @@ class UnrolledSPENModel(torch.nn.Module):
         prev_energy = prev_ys.new_full((batch_size,), -float('inf'))
         opt = EntropicMirrorAscentOptimizer(**self.optim_kwargs)
         for _ in range(self.inference_iterations):
+            ys = torch.softmax(ys, dim=-1)
             energy = self.global_network(ys, potentials) \
                    - self.entropy_coef * (ys * torch.log(ys + EPS)).sum(dim=(1, 2))
             if (
@@ -100,7 +102,7 @@ class UnrolledSPENModel(torch.nn.Module):
                 and torch.all((energy - prev_energy).abs() < self.inference_eps)
             ): break
             prev_energy = energy
-            ys, = opt.step(energy.sum(), ys)
+            ys = opt.step(energy.sum(), ys)
             if (
                 self.inference_region_eps is not None
                 and torch.all((prev_ys - ys).norm(dim=2) < self.inference_region_eps)
