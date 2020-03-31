@@ -5,8 +5,7 @@ import numpy as np
 
 EPS = 1e-6
 
-
-class EntropicMirrorAscentOptimizer(object):
+class GradientAscentOptimizer(object):
     def __init__(
             self,
             lr: float,
@@ -27,6 +26,23 @@ class EntropicMirrorAscentOptimizer(object):
                 yield self._lr / iteration
             iteration += 1
 
+    def step(
+            self,
+            loss: torch.Tensor,
+            ys: torch.Tensor) -> torch.Tensor:
+        grad, = torch.autograd.grad(
+            loss,
+            ys,
+            create_graph=self._track_higher_grads,
+            allow_unused=True
+        )
+        ys = ys + next(self.lr) * grad
+        if self._track_higher_grads:
+            return ys
+        return ys.detach().requires_grad_()
+
+
+class EntropicMirrorAscentOptimizer(GradientAscentOptimizer):
     def step(
             self,
             loss: torch.Tensor,

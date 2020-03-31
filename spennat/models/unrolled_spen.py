@@ -2,11 +2,11 @@
 import torch
 import torch.nn.functional as F
 
-from spennat.utils import random_probabilities
-from spennat.optim import EntropicMirrorAscentOptimizer
-
-
-EPS = 1e-6
+from spennat.utils import random_probabilities, entropy
+from spennat.optim import (
+    EntropicMirrorAscentOptimizer,
+    GradientAscentOptimizer
+)
 
 
 class UnrolledSPENModel(torch.nn.Module):
@@ -24,17 +24,25 @@ class UnrolledSPENModel(torch.nn.Module):
         self.inference_eps = cfg.inference.eps
         self.inference_region_eps = cfg.inference.region_eps
         self.entropy_coef = cfg.entropy_coef
-        self.optim_kwargs = dict(
-            lr=cfg.inference.learning_rate,
-            use_sqrt_decay=cfg.inference.use_sqrt_decay,
-            track_higher_grads=True
-        )
+        def get_optimizer():
+            optim_kwargs = dict(
+                lr=cfg.inference.learning_rate,
+                use_sqrt_decay=cfg.inference.use_sqrt_decay,
+                track_higher_grads=True
+            )
+            if cfg.inference.optim_type == 'simple':
+                return GradientAscentOptimizer(**optim_kwargs)
+            elif cfg.inference.optim_type == 'entropic':
+                return EntropicMirrorAscentOptimizer(**optim_kwargs)
+            else:
+                raise RuntimeError("Unknown optim_type")
+        self.get_optimizer = get_optimizer
 
     def forward(self, xs):
         """
         Arguments:
             xs {torch.Tensor} -- (batch size, INPUTS)
-        
+
         Returns:
             [torch.Tensor] -- (batch size, num_nodes, num_vals)
         """
@@ -48,14 +56,13 @@ class UnrolledSPENModel(torch.nn.Module):
         ys = torch.log(random_probabilities(
             batch_size, self.num_nodes, self.num_vals,
             device=potentials.device, requires_grad=True))
-        # hs = ys.new_zeros(1)  # batch size?
         prev_ys = ys
         prev_energy = prev_ys.new_full((batch_size,), -float('inf'))
-        opt = EntropicMirrorAscentOptimizer(**self.optim_kwargs)
+        opt = self.get_optimizer()
         for _ in range(self.inference_iterations):
-            ys = torch.softmax(ys, dim=-1)
-            energy = self.global_network(ys, potentials) \
-                   - self.entropy_coef * (ys * torch.log(ys + EPS)).sum(dim=(1, 2))
+            energy = self.global_network(torch.softmax(ys, dim=2), potentials)
+            if self.entropy_coef > 0.0:
+                energy += self.entropy_coef * entropy(ys, dim=(1, 2))
             if (
                 self.inference_eps is not None
                 and torch.all((energy - prev_energy).abs() < self.inference_eps)
@@ -74,7 +81,7 @@ class UnrolledSPENModel(torch.nn.Module):
         return F.cross_entropy(pred.view(-1, self.num_vals), ys.view(-1))
 
     def predict_beliefs(self, xs):
-        return self.forward(xs)
+        return self.forward(xs).softmax(dim=2)
 
     def predict(self, xs):
         return self.forward(xs).argmax(dim=2)

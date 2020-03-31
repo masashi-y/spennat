@@ -1,5 +1,8 @@
-
 import torch
+
+
+EPS = 1e-6
+
 
 def get_device(gpu_id):
     if gpu_id is not None and gpu_id >= 0:
@@ -12,6 +15,10 @@ def onehot(x, n):
     x1 = x.new_zeros(len(x0), n, dtype=torch.float)
     x1.scatter_(1, x0, 1)
     return x1.view(x.size() + (n,))
+
+
+def entropy(x, dim=-1):
+    return - (x * torch.log(x + EPS)).sum(dim=dim)
 
 
 def save_model(model, file_path):

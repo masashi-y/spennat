@@ -1,2 +1,0 @@
-
-from .entropic_mirror_ascent import EntropicMirrorAscentOptimizer

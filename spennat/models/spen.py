@@ -1,8 +1,7 @@
 
 import torch
-import numpy as np
 
-from spennat.utils import random_probabilities
+from spennat.utils import random_probabilities, entropy
 from spennat.optim import EntropicMirrorAscentOptimizer
 
 
@@ -54,8 +53,9 @@ class SPENModel(torch.nn.Module):
         opt = EntropicMirrorAscentOptimizer(**self.optim_kwargs)
         for _ in range(self.inference_iterations):
             self.global_network.zero_grad()
-            energy = self.global_network(ys, potentials) \
-                   - self.entropy_coef * (ys * torch.log(ys + EPS)).sum(dim=(1, 2))
+            energy = self.global_network(ys, potentials)
+            if self.entropy_coef > 0.0:
+                energy += self.entropy_coef * entropy(ys, dim=(1, 2))
             if (
                 self.inference_eps is not None
                 and torch.all((energy - prev_energy).abs() < self.inference_eps)
@@ -75,8 +75,9 @@ class SPENModel(torch.nn.Module):
         self.zero_grad()
         pred_energy = self.global_network(preds, potentials)
         true_energy = self.global_network(ys, potentials)
-        loss = pred_energy - true_energy \
-             - self.entropy_coef * (preds * torch.log(preds + EPS)).sum(dim=(1, 2))
+        loss = pred_energy - true_energy
+        if self.entropy_coef > 0.0:
+                loss += self.entropy_coef * entropy(ys, dim=(1, 2))
         return loss.mean()
 
     def predict_beliefs(self, xs):
