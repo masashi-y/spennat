@@ -1,7 +1,9 @@
 
 import torch
 import numpy as np
+
 from spennat.utils import random_probabilities
+from spennat.optim import EntropicMirrorAscentOptimizer
 
 
 EPS = 1e-6
@@ -18,8 +20,8 @@ class SPENModel(torch.nn.Module):
             feature_network {torch.nn.Module} -- feature network mapping (batch size, input dim) -> (batch size, num_nodes, num_vals)
             global_network {torch.nn.Module} -- energy network mapping (batch size, output dim) -> (batch size,)
             cfg {dict} --  config dictionary
-            num_nodes {int} -- 
-            num_vals {int} -- 
+            num_nodes {int} --
+            num_vals {int} --
         """
         super().__init__()
         self.feature_network = feature_network
@@ -27,46 +29,45 @@ class SPENModel(torch.nn.Module):
         self.num_nodes = num_nodes
         self.num_vals = num_vals
         self.inference_iterations = cfg.inference.iterations
-        self.inference_learning_rate = cfg.inference.learning_rate
         self.inference_eps = cfg.inference.eps
         self.inference_region_eps = cfg.inference.region_eps
-        self.use_sqrt_decay = cfg.inference.use_sqrt_decay
         self.entropy_coef = cfg.entropy_coef
+        self.optim_kwargs = dict(
+            lr=cfg.inference.learning_rate,
+            use_sqrt_decay=cfg.inference.use_sqrt_decay,
+            track_higher_grads=False
+        )
 
-    def _lr(self, iteration):
-        if self.use_sqrt_decay:
-            return self.inference_learning_rate / np.sqrt(iteration)
-        return self.inference_learning_rate / iteration
+    def forward(self, xs):
+        potentials = self.feature_network(xs)
+        preds = self._gradient_based_inference(potentials)
+        return preds
 
     def _gradient_based_inference(self, potentials):
         batch_size = potentials.size(0)
         potentials = potentials.detach()
-        pred = random_probabilities(
-            batch_size, self.num_nodes, self.num_vals, potentials.device)
-        prev = pred
-        prev_energy = prev.new_full((batch_size,), -float('inf'))
-        for iteration in range(1, self.inference_iterations):
+        ys = random_probabilities(
+            batch_size, self.num_nodes, self.num_vals,
+            device=potentials.device, requires_grad=True)
+        prev_ys = ys
+        prev_energy = prev_ys.new_full((batch_size,), -float('inf'))
+        opt = EntropicMirrorAscentOptimizer(**self.optim_kwargs)
+        for _ in range(self.inference_iterations):
             self.global_network.zero_grad()
-            pred = pred.detach().requires_grad_()
-            energy = self.global_network(pred, potentials) \
-                   - self.entropy_coef * (pred * torch.log(pred + EPS)).sum(dim=(1, 2))
+            energy = self.global_network(ys, potentials) \
+                   - self.entropy_coef * (ys * torch.log(ys + EPS)).sum(dim=(1, 2))
             if (
                 self.inference_eps is not None
                 and torch.all((energy - prev_energy).abs() < self.inference_eps)
             ): break
             prev_energy = energy
-
-            energy.sum().backward()
-            lr_grad = self._lr(iteration) * pred.grad
-            max_grad, _ = lr_grad.max(dim=-1, keepdim=True)
-            pred = pred * torch.exp(lr_grad - max_grad)
-            pred = pred / (pred.sum(dim=-1, keepdim=True) + EPS)
+            ys = opt.step(energy.sum(), ys)
             if (
                 self.inference_region_eps is not None
-                and torch.all((prev - pred).norm(dim=2) < self.inference_region_eps)
+                and torch.all((prev_ys - ys).norm(dim=2) < self.inference_region_eps)
             ): break
-            prev = pred
-        return pred
+            prev_ys = ys
+        return ys
 
     def loss(self, xs, ys):
         potentials = self.feature_network(xs)
@@ -79,9 +80,7 @@ class SPENModel(torch.nn.Module):
         return loss.mean()
 
     def predict_beliefs(self, xs):
-        potentials = self.feature_network(xs)
-        preds = self._gradient_based_inference(potentials)
-        return preds
+        return self.forward(xs)
 
     def predict(self, xs):
         potentials = self.feature_network(xs)
