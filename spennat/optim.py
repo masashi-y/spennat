@@ -12,19 +12,17 @@ class GradientAscentOptimizer(object):
             use_sqrt_decay: bool = True,
             track_higher_grads: bool = True,
     ) -> None:
+        self.iteration = 0
         self._lr = lr
         self.use_sqrt_decay = use_sqrt_decay
         self._track_higher_grads = track_higher_grads
 
     @property
     def lr(self) -> float:
-        iteration = 1
-        while True:
-            if self.use_sqrt_decay:
-                yield self._lr / np.sqrt(iteration)
-            else:
-                yield self._lr / iteration
-            iteration += 1
+        iteration += 1
+        if self.use_sqrt_decay:
+            return self._lr / np.sqrt(self.iteration)
+        return self._lr / self.iteration
 
     def step(
             self,
