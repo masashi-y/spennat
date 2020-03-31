@@ -199,7 +199,7 @@ def main(cfg: DictConfig) -> None:
     np.random.seed(0)
 
     device = utils.get_device(cfg.device)
-    train_data, val_data, test_data =  load_bibtex(
+    train_data, val_data, test_data = load_bibtex(
         hydra.utils.to_absolute_path(cfg.train),
         hydra.utils.to_absolute_path(cfg.test),
         train_ratio=cfg.train_ratio,
@@ -236,6 +236,9 @@ def main(cfg: DictConfig) -> None:
         model.feature_network = unary_model.feature_network
         if cfg.feature_network.freeze:
             model.feature_network.requires_grad_(False)
+    if cfg.pretrained_model:
+        assert cfg.pretrained_unary is None
+        utils.load_model(model, hydra.utils.to_absolute_path(cfg.pretrained_model))
     model = model.to(device)
 
     with TensorBoard(f'{cfg.model}_train') as train_logger, \
@@ -260,7 +263,7 @@ def main(cfg: DictConfig) -> None:
     logger.info('train: %f, %f, %f, %f', train_acc, train_prec, train_rec, train_f1)
     logger.info('val:   %f, %f, %f, %f', val_acc, val_prec, val_rec, val_f1)
     logger.info('test:  %f, %f, %f, %f', test_acc, test_prec, test_rec, test_f1)
-            
+
 
 if __name__ == '__main__':
     main()

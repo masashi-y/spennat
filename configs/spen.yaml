@@ -6,6 +6,7 @@ use_cross_ent: false
 optimizer: sgd(lr=0.01, momentum=0.9, weight_decay=0.0)
 
 pretrained_unary: null
+pretrained_model: null
 
 clip_grad_norm: null
 clip_grad: null

@@ -7,6 +7,7 @@ optimizer: adam(lr=0.001, betas=(0.9, 0.999), eps=1e-04, weight_decay=0, amsgrad
 # optimizer: sgd(lr=0.01, momentum=0.9, weight_decay=0.0)
 
 pretrained_unary: null
+pretrained_model: null
 
 clip_grad_norm: null
 clip_grad: 1.0
